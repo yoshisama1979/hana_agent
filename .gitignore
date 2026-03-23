@@ -1,2 +1,7 @@
 .env
+!.env.example
 accounting/data/
+__pycache__/
+.python-version
+main.py
+.claude/
