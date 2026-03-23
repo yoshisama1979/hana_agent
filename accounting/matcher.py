@@ -63,12 +63,19 @@ def match(risona: pd.DataFrame, journal: pd.DataFrame) -> MatchResult:
             journal_only_rows.append(j_rows)
         elif jc == 0:
             risona_only_rows.append(r_rows)
-        elif rc == 1 and jc == 1:
-            # 1:1 一致 → matched
-            merged = r_rows.join(j_rows, rsuffix="_journal")
-            matched_rows.append(merged)
+        elif rc == jc:
+            # 件数一致（1:1 または N:N）→ matched（N:N は要目視フラグ付き）
+            needs_review = rc > 1
+            for i in range(rc):
+                pair = (
+                    r_rows.iloc[[i]]
+                    .reset_index(drop=True)
+                    .join(j_rows.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
+                )
+                pair["要目視確認"] = "要確認" if needs_review else ""
+                matched_rows.append(pair)
         else:
-            # N:N（N>1）または件数不一致 → duplicates（ペアとして結合）
+            # 件数不一致 → duplicates＋余剰は未照合へ
             for i in range(min(rc, jc)):
                 pair = (
                     r_rows.iloc[[i]]
@@ -76,7 +83,6 @@ def match(risona: pd.DataFrame, journal: pd.DataFrame) -> MatchResult:
                     .join(j_rows.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
                 )
                 dup_rows.append(pair)
-            # 余剰分は未照合へ
             if rc > jc:
                 risona_only_rows.append(r_rows.iloc[jc:].reset_index(drop=True))
             elif jc > rc:

@@ -1,7 +1,7 @@
 import re
 import unicodedata
 
-_UNCONFIRMED = {"勘定科目": "★要確認", "補助科目": "", "税区分": ""}
+_UNCONFIRMED = {"入力名": "", "勘定科目": "★要確認", "補助科目": "", "税区分": ""}
 
 
 def _normalize(text: str) -> str:
@@ -18,6 +18,7 @@ def classify(merchant: str, rules: list[dict]) -> dict:
         pattern = _normalize(rule["match"])
         if re.search(pattern, normalized):
             return {
+                "入力名": rule.get("入力名", ""),
                 "勘定科目": rule.get("勘定科目", "★要確認"),
                 "補助科目": rule.get("補助科目", ""),
                 "税区分": rule.get("税区分", ""),

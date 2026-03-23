@@ -33,9 +33,9 @@ def test_match_returns_matched_when_amount_and_date_match():
 
 
 # ---------------------------------------------------------------------------
-# S2: 同日・同金額が複数ある行を重複として分類する
+# S2: 同日・同金額が複数あるが件数一致 → matched に入り要目視フラグが立つ
 # ---------------------------------------------------------------------------
-def test_match_returns_duplicates_when_same_date_amount_appears_multiple_times():
+def test_match_returns_matched_with_review_flag_when_same_date_amount_n_to_n():
     # Given
     risona = _risona([
         {"利用日": "2025年04月07日", "利用内容": "SHOPА", "金額": "1000"},
@@ -50,8 +50,30 @@ def test_match_returns_duplicates_when_same_date_amount_appears_multiple_times()
     result = match(risona, journal)
 
     # Then
-    assert len(result.duplicates) == 2
-    assert len(result.matched) == 0
+    assert len(result.matched) == 2
+    assert (result.matched["要目視確認"] == "要確認").all()
+    assert len(result.duplicates) == 0
+
+
+# ---------------------------------------------------------------------------
+# S2b: 同日・同金額だが件数不一致 → duplicates＋余剰は未照合
+# ---------------------------------------------------------------------------
+def test_match_returns_duplicates_when_counts_differ():
+    # Given
+    risona = _risona([
+        {"利用日": "2025年04月07日", "利用内容": "SHOPА", "金額": "1000"},
+        {"利用日": "2025年04月07日", "利用内容": "SHOPB", "金額": "1000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/07", "借方金額(円)": "1000", "摘要": "VISAデビ 0000001A"},
+    ])
+
+    # When
+    result = match(risona, journal)
+
+    # Then
+    assert len(result.duplicates) == 1
+    assert len(result.risona_only) == 1
 
 
 # ---------------------------------------------------------------------------
