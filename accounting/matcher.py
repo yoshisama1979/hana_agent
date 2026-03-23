@@ -21,14 +21,11 @@ def _normalize_date(series: pd.Series) -> pd.Series:
     """
 
     def _to_iso(val: str) -> str:
-        # 「年月日」形式
-        m = re.fullmatch(r"(\d{4})年(\d{2})月(\d{2})日", val.strip())
-        if m:
-            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-        # スラッシュ区切り形式
-        m = re.fullmatch(r"(\d{4})/(\d{2})/(\d{2})", val.strip())
-        if m:
-            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        s = val.strip()
+        for pattern in (r"(\d{4})年(\d{2})月(\d{2})日", r"(\d{4})/(\d{2})/(\d{2})"):
+            m = re.fullmatch(pattern, s)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
         raise ValueError(f"日付フォーマット不明: {val!r}")
 
     return series.apply(_to_iso)
