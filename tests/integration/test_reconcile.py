@@ -42,6 +42,12 @@ def _write_journal(path: Path) -> None:
          "借方勘定科目": "租税公課", "借方補助科目": "", "借方金額(円)": "5000",
          "貸方勘定科目": "現金", "貸方補助科目": "", "貸方金額(円)": "5000",
          "摘要": "印紙"},
+        # SBI - 海外通貨案件：仕訳帳側は本体+手数料の合算で計上されている
+        # （明細では VERCEL 2881 + 海外事務手数料 72 = 2953）
+        {"取引No": "5", "取引日": "2025/05/15",
+         "借方勘定科目": "支払手数料", "借方補助科目": "", "借方金額(円)": "2953",
+         "貸方勘定科目": "普通預金", "貸方補助科目": SBI_ACCOUNT, "貸方金額(円)": "2953",
+         "摘要": "VERCEL INC."},
     ])
     # 不足カラムは空で埋める（実ファイルに合わせる）
     for col in ["借方部門", "借方取引先", "借方税区分", "借方インボイス",
@@ -81,6 +87,7 @@ def _write_sbi_meisai(dir_path: Path) -> None:
     )
 
     # may でも APPLE COM BILL が重複（実データの月またぎを再現）
+    # VERCEL は本体2881 + 海外事務手数料72 で、仕訳帳側は2953で計上されている → パス2でマッチ
     df_may = pd.DataFrame([
         ["2", "2025/04/29", "APPLE COM BILL", "JPY", "400.00",
          "0.00", "0.00", "0.00", "", "0.00", "0.00", "0.00"],
@@ -136,6 +143,7 @@ def setup_env(tmp_path):
             merchant_col="お取引内容",
             has_status=False,
             debit_pattern=str(sbi_dir / "meisai_*.csv"),
+            fee_cols=("海外事務手数料",),
         ),
     ]
 
@@ -219,3 +227,55 @@ def test_sbi_duplicate_rows_are_deduplicated(setup_env):
     # APPLE COM BILL は2ファイルに同一行で重複しているが1件にまとめる
     apple = df[df["お取引内容"] == "APPLE COM BILL"]
     assert len(apple) == 1
+
+
+# ---------------------------------------------------------------------------
+# R-1, R-3: パス1の行は金額種別=本体、パス2の行は金額種別=本体+手数料
+# VERCEL（本体2881+手数料72=2953）は仕訳帳側で2953なのでパス2でマッチ
+# ---------------------------------------------------------------------------
+def test_sbi_fee_inclusive_match_tagged_correctly(setup_env):
+    run(**setup_env)
+
+    df = pd.read_csv(
+        setup_env["output"] / "sbi" / "カード_照合済み.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+
+    # APPLE COM BILL はパス1（金額そのまま）でマッチ
+    apple = df[df["お取引内容"] == "APPLE COM BILL"].iloc[0]
+    assert apple["金額種別"] == "本体"
+
+    # VERCEL INC. はパス2（本体+手数料）でマッチ
+    vercel = df[df["お取引内容"] == "VERCEL INC."].iloc[0]
+    assert vercel["金額種別"] == "本体+手数料"
+
+
+# ---------------------------------------------------------------------------
+# R-5: fee_cols を持たないりそなはパス2を行わず、すべて 金額種別=本体
+# ---------------------------------------------------------------------------
+def test_risona_matched_rows_all_tagged_as_main(setup_env):
+    run(**setup_env)
+
+    df = pd.read_csv(
+        setup_env["output"] / "risona" / "カード_照合済み.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    assert (df["金額種別"] == "本体").all()
+
+
+# ---------------------------------------------------------------------------
+# R-6: 仕訳帳のみ.csv からはパス1+パス2 両方の消化分が除外される
+# 取引No 5（VERCEL）はパス2で消化されるので残らない
+# ---------------------------------------------------------------------------
+def test_journal_only_excludes_fee_inclusive_matches(setup_env):
+    run(**setup_env)
+
+    df = pd.read_csv(
+        setup_env["output"] / "仕訳帳のみ.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    nos = set(df["取引No"].astype(str))
+    assert "5" not in nos  # パス2で消化されているので残ってはいけない

@@ -48,7 +48,7 @@ COMPACT_COLS = [
     "利用内容（入力）",
     "借方勘定科目", "借方勘定科目（入力）", "補助科目（入力）", "借方金額(円)",
     "貸方勘定科目", "貸方補助科目", "貸方金額(円)", "摘要",
-    "要目視確認", "照合方法", "日付ズレ日数",
+    "要目視確認", "照合方法", "日付ズレ日数", "金額種別",
 ]
 
 
@@ -119,31 +119,133 @@ def _journal_card_scope(journal: pd.DataFrame, profile: CardProfile) -> pd.DataF
 def reconcile_card(
     profile: CardProfile, journal: pd.DataFrame, rules: list,
 ) -> tuple[CardReport, MatchResult]:
-    """1カード分を照合し、CardReport と生の MatchResult を返す"""
+    """1カード分を照合し、CardReport と生の MatchResult を返す。
+
+    profile.fee_cols が指定されている場合、パス1（本体金額のみ）で残った debit_only に対し、
+    パス2（本体+手数料の合算金額）で再照合する。
+    """
     debit_all = profile.load_debit()
     debit_target, pending, declined = _filter_by_status(debit_all, profile)
 
     journal_scope = _journal_card_scope(journal, profile)
 
-    result = match(
+    # パス1：本体金額のみで段階マッチング
+    pass1 = match(
         debit_target, journal_scope,
         debit_date_col=profile.date_col,
         debit_amount_col=profile.amount_col,
         date_tolerance_days=profile.date_tolerance_days,
     )
+    matched_chunks = [_tag_amount_kind(pass1.matched, "本体")]
+    duplicates_chunks = [_tag_amount_kind(pass1.duplicates, "本体")]
+    debit_only_remaining = pass1.debit_only
+    journal_only_remaining = pass1.journal_only
 
-    matched_df    = _add_account(result.matched,    profile.merchant_col, rules)
-    debit_only_df = _add_account(result.debit_only, profile.merchant_col, rules)
+    # パス2：本体+手数料の合算金額で再照合（fee_cols 指定時のみ）
+    if profile.fee_cols and not debit_only_remaining.empty:
+        debit_with_fee, original_amount_col_backup = _build_fee_inclusive_debit(
+            debit_only_remaining, profile,
+        )
+        if not debit_with_fee.empty:
+            pass2 = match(
+                debit_with_fee, journal_only_remaining,
+                debit_date_col=profile.date_col,
+                debit_amount_col=profile.amount_col,
+                date_tolerance_days=profile.date_tolerance_days,
+            )
+            # パス2でマッチした行は元の金額列に戻してから出力する
+            pass2_matched = _restore_original_amount(
+                pass2.matched, profile.amount_col, original_amount_col_backup,
+            )
+            pass2_duplicates = _restore_original_amount(
+                pass2.duplicates, profile.amount_col, original_amount_col_backup,
+            )
+            pass2_debit_only = _restore_original_amount(
+                pass2.debit_only, profile.amount_col, original_amount_col_backup,
+            )
+            matched_chunks.append(_tag_amount_kind(pass2_matched, "本体+手数料"))
+            duplicates_chunks.append(_tag_amount_kind(pass2_duplicates, "本体+手数料"))
+            # パス2対象外（手数料0の行）と パス2でも未消化の行を再合流
+            debit_excluded = debit_only_remaining[
+                ~debit_only_remaining.index.isin(debit_with_fee.index)
+            ]
+            debit_only_remaining = pd.concat(
+                [debit_excluded, pass2_debit_only], ignore_index=True,
+            )
+            journal_only_remaining = pass2.journal_only
+
+    matched_all     = _concat_nonempty(matched_chunks)
+    duplicates_all  = _concat_nonempty(duplicates_chunks)
+
+    matched_df    = _add_account(matched_all, profile.merchant_col, rules)
+    debit_only_df = _add_account(debit_only_remaining, profile.merchant_col, rules)
 
     report = CardReport(
         profile=profile,
         matched=matched_df,
-        duplicates=result.duplicates,
+        duplicates=duplicates_all,
         debit_only=debit_only_df,
         pending=pending,
         declined=declined,
     )
-    return report, result
+    # 後方互換用に末尾の MatchResult は journal_only のみ意味を保つ
+    final_result = MatchResult(
+        matched=matched_all,
+        duplicates=duplicates_all,
+        debit_only=debit_only_remaining,
+        journal_only=journal_only_remaining,
+    )
+    return report, final_result
+
+
+_AMOUNT_BACKUP_COL = "_original_amount"
+
+
+def _build_fee_inclusive_debit(
+    debit_only: pd.DataFrame, profile: CardProfile,
+) -> tuple[pd.DataFrame, str]:
+    """パス2用に「本体+手数料」金額列を上書きした DataFrame を返す。
+
+    対象は fee_cols のいずれかが0より大きい行のみ。元の金額は _original_amount に退避。
+    """
+    df = debit_only.copy()
+    fees_total = sum(df[c].astype(float) for c in profile.fee_cols)
+    has_fee = fees_total > 0
+    df = df[has_fee].copy()
+    if df.empty:
+        return df, _AMOUNT_BACKUP_COL
+
+    df[_AMOUNT_BACKUP_COL] = df[profile.amount_col]
+    df[profile.amount_col] = (
+        df[profile.amount_col].astype(float) + fees_total[has_fee]
+    ).astype(str)
+    return df, _AMOUNT_BACKUP_COL
+
+
+def _restore_original_amount(
+    df: pd.DataFrame, amount_col: str, backup_col: str,
+) -> pd.DataFrame:
+    """パス2用に上書きした金額列を元の値に戻す。"""
+    if df.empty or backup_col not in df.columns:
+        return df
+    df = df.copy()
+    df[amount_col] = df[backup_col]
+    df = df.drop(columns=[backup_col], errors="ignore")
+    return df
+
+
+def _tag_amount_kind(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """金額種別列を付与する。空 DataFrame はそのまま返す。"""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["金額種別"] = kind
+    return df
+
+
+def _concat_nonempty(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    nonempty = [f for f in frames if not f.empty]
+    return pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
 
 
 def _write_card_outputs(report: CardReport, output_dir: Path) -> None:
@@ -190,14 +292,23 @@ def _print_summary(reports: list[CardReport], journal_only_count: int) -> None:
         else:
             print(f"カード照合({report.profile.card_id}): × 未解決 {total}件")
 
-        # 段階別の消化件数を表示（date_tolerance_days > 0 のカードのみ意味あり）
-        if not report.matched.empty and "日付ズレ日数" in report.matched.columns:
-            offset_counts = (
-                report.matched["日付ズレ日数"].astype(int).value_counts().sort_index()
+        # 金額種別 × 段階（日付ズレ日数）別の消化件数を表示
+        if (
+            not report.matched.empty
+            and "日付ズレ日数" in report.matched.columns
+            and "金額種別" in report.matched.columns
+        ):
+            grouped = (
+                report.matched.assign(
+                    _offset=report.matched["日付ズレ日数"].astype(int)
+                )
+                .groupby(["金額種別", "_offset"])
+                .size()
+                .sort_index()
             )
-            for offset, count in offset_counts.items():
-                label = "完全一致" if offset == 0 else f"日付ズレ ±{offset}日"
-                print(f"  {label}: {count}件")
+            for (kind, offset), count in grouped.items():
+                stage = "完全一致" if offset == 0 else f"日付ズレ ±{offset}日"
+                print(f"  {kind} {stage}: {count}件")
 
         for key, value in issues.items():
             if value > 0:

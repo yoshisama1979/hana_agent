@@ -24,6 +24,8 @@ def test_sbi_profile_is_defined():
     assert sbi.has_status is False
     # 利用日と引落日のズレを吸収するため、SBIは±7日まで段階的に許容する
     assert sbi.date_tolerance_days == 7
+    # 海外通貨取引は仕訳帳側で「本体+手数料」の合算金額で1行に計上されるため
+    assert sbi.fee_cols == ("海外事務手数料",)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,8 @@ def test_risona_profile_is_defined():
     assert risona.has_status is True
     # りそなは現状ズレ吸収不要なので 0（厳格一致のみ）
     assert risona.date_tolerance_days == 0
+    # りそなは海外取引時の手数料合算がない想定
+    assert risona.fee_cols == ()
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,22 @@ def test_card_profile_date_tolerance_default_is_zero():
         debit_pattern="dummy",
     )
     assert profile.date_tolerance_days == 0
+
+
+# ---------------------------------------------------------------------------
+# A-4: fee_cols のデフォルトは空タプル（後方互換）
+# ---------------------------------------------------------------------------
+def test_card_profile_fee_cols_default_is_empty():
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="金額",
+        merchant_col="利用内容",
+        has_status=False,
+        debit_pattern="dummy",
+    )
+    assert profile.fee_cols == ()
 
 
 # ---------------------------------------------------------------------------

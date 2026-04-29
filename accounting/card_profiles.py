@@ -28,6 +28,9 @@ class CardProfile:
     debit_encoding: str = "cp932"
     # 日付許容ズレ。0 なら厳格一致のみ、>0 なら段階マッチで ±N日まで吸収する。
     date_tolerance_days: int = 0
+    # フォールバック用の手数料カラム。指定すると amount_col + Σ(fee_cols) でも再照合する。
+    # SBIでは海外通貨取引が「本体+海外事務手数料」の合算で仕訳帳に計上されるケース対応。
+    fee_cols: tuple[str, ...] = ()
 
     def load_debit(self) -> pd.DataFrame:
         """明細CSVを読み込んで返す。
@@ -76,5 +79,7 @@ PROFILES: dict[str, CardProfile] = {
         debit_pattern=str(Path("data/accounting/meisai_*.csv")),
         # SBIは「カード利用日」と「口座引落日」が最大数日ズレるため段階マッチで吸収する
         date_tolerance_days=7,
+        # 海外通貨取引は仕訳帳側で「本体+海外事務手数料」の合算金額で1行に計上される
+        fee_cols=("海外事務手数料",),
     ),
 }
