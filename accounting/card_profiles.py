@@ -77,8 +77,9 @@ PROFILES: dict[str, CardProfile] = {
         merchant_col="お取引内容",
         has_status=False,
         debit_pattern=str(Path("data/accounting/meisai_*.csv")),
-        # SBIは「カード利用日」と「口座引落日」が最大数日ズレるため段階マッチで吸収する
-        date_tolerance_days=7,
+        # SBIは「カード利用日」と「口座引落日」が最大2週間程度ズレるため段階マッチで吸収する
+        # （定期決済系でカード利用日から実引落まで9〜11日ほどかかるケースを想定）
+        date_tolerance_days=14,
         # 海外通貨取引は仕訳帳側で「本体+海外事務手数料」の合算金額で1行に計上される
         fee_cols=("海外事務手数料",),
     ),

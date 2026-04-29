@@ -22,8 +22,9 @@ def test_sbi_profile_is_defined():
     assert sbi.amount_col == "お取引金額"
     assert sbi.merchant_col == "お取引内容"
     assert sbi.has_status is False
-    # 利用日と引落日のズレを吸収するため、SBIは±7日まで段階的に許容する
-    assert sbi.date_tolerance_days == 7
+    # 利用日と引落日のズレを吸収するため、SBIは±14日まで段階的に許容する
+    # （エフィールウォーター等で実際に約9〜11日ズレるケースがある）
+    assert sbi.date_tolerance_days == 14
     # 海外通貨取引は仕訳帳側で「本体+手数料」の合算金額で1行に計上されるため
     assert sbi.fee_cols == ("海外事務手数料",)
 
