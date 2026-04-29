@@ -279,3 +279,110 @@ def test_journal_only_excludes_fee_inclusive_matches(setup_env):
     )
     nos = set(df["取引No"].astype(str))
     assert "5" not in nos  # パス2で消化されているので残ってはいけない
+
+
+# ---------------------------------------------------------------------------
+# S-1（リグレッション）：日付近さ優先で、本体+手数料が大ズレ本体マッチに勝つ
+#
+# 想定シナリオ：
+#   仕訳帳: 2026/01/28 金額3175 (VERCEL の本体+手数料3098+77=3175 が同日マッチすべき)
+#   仕訳帳: 2026/01/17 金額3254 (CLAUDE.AI の本体+手数料3175+79=3254 が ±1日でマッチすべき)
+#   明細  : VERCEL 2026/01/28 本体3098 + 手数料77 = 3175
+#   明細  : CLAUDE.AI 2026/01/16 本体3175 + 手数料79 = 3254
+#
+# 旧ロジック（パス1全段階→パス2全段階）では CLAUDE.AI 本体3175 が
+# 12日違いで仕訳帳3175を奪ってしまい、VERCEL が未入力に残る。
+# 新ロジック（段階×戦略入れ子）では同日3175が VERCEL に正しくマッチする。
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def vercel_regression_env(tmp_path):
+    journal = tmp_path / "仕訳帳.csv"
+    rules = tmp_path / "rules.yml"
+    output_dir = tmp_path / "output"
+    sbi_dir = tmp_path / "sbi_dir"
+    sbi_dir.mkdir()
+
+    # 仕訳帳：VERCEL 同日3175、CLAUDE.AI ±1日3254
+    journal_df = pd.DataFrame([
+        {"取引No": "100", "取引日": "2026/01/28",
+         "借方勘定科目": "★要確認", "借方補助科目": "", "借方金額(円)": "3175",
+         "貸方勘定科目": "普通預金", "貸方補助科目": SBI_ACCOUNT, "貸方金額(円)": "3175",
+         "摘要": "デビット 614771"},
+        {"取引No": "101", "取引日": "2026/01/17",
+         "借方勘定科目": "★要確認", "借方補助科目": "", "借方金額(円)": "3254",
+         "貸方勘定科目": "普通預金", "貸方補助科目": SBI_ACCOUNT, "貸方金額(円)": "3254",
+         "摘要": "デビット 974182"},
+    ])
+    for col in ["借方部門", "借方取引先", "借方税区分", "借方インボイス",
+                "貸方部門", "貸方取引先", "貸方税区分", "貸方インボイス",
+                "タグ", "メモ"]:
+        if col not in journal_df.columns:
+            journal_df[col] = ""
+    journal_df.to_csv(journal, index=False, encoding="cp932")
+
+    # SBI明細：VERCEL 2026/01/28、CLAUDE.AI 2026/01/16
+    common_cols = ["1", "お取引日", "お取引内容", "お取引通貨", "お取引金額",
+                   "お取引手数料", "ATM手数料", "海外事務手数料", "ご利用通貨",
+                   "ご利用金額", "ご利用手数料", "換算レート"]
+    sbi_df = pd.DataFrame([
+        ["2", "2026/01/28", "VERCEL INC.", "JPY", "3098.00",
+         "0.00", "0.00", "77.00", "USD", "20.00", "0.00", "154.90"],
+        ["2", "2026/01/16", "CLAUDE.AI SUBSCRIPTION", "JPY", "3175.00",
+         "0.00", "0.00", "79.00", "USD", "20.00", "0.00", "158.75"],
+    ], columns=common_cols)
+    (sbi_dir / "meisai.csv").write_text(sbi_df.to_csv(index=False), encoding="cp932")
+
+    rules.write_text("rules: []\n", encoding="utf-8")
+
+    profiles = [
+        CardProfile(
+            card_id="sbi",
+            account_name=SBI_ACCOUNT,
+            date_col="お取引日",
+            amount_col="お取引金額",
+            merchant_col="お取引内容",
+            has_status=False,
+            debit_pattern=str(sbi_dir / "meisai*.csv"),
+            date_tolerance_days=14,
+            fee_cols=("海外事務手数料",),
+        ),
+    ]
+    return {
+        "profiles": profiles,
+        "journal": journal,
+        "rules": rules,
+        "output": output_dir,
+    }
+
+
+def test_date_proximity_priority_avoids_far_body_match_stealing_close_combined_match(
+    vercel_regression_env,
+):
+    run(**vercel_regression_env)
+
+    matched = pd.read_csv(
+        vercel_regression_env["output"] / "sbi" / "カード_照合済み.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    debit_only = pd.read_csv(
+        vercel_regression_env["output"] / "sbi" / "カード_未入力.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+
+    # 両明細とも消化されていること
+    assert len(debit_only) == 0
+    assert len(matched) == 2
+
+    # VERCEL は同日（offset=0）の本体+手数料でマッチ
+    vercel = matched[matched["お取引内容"] == "VERCEL INC."].iloc[0]
+    assert vercel["金額種別"] == "本体+手数料"
+    assert int(vercel["日付ズレ日数"]) == 0
+    assert vercel["取引No"] == "100"
+
+    # CLAUDE.AI は±1日（offset=1）の本体+手数料でマッチ
+    claude = matched[matched["お取引内容"] == "CLAUDE.AI SUBSCRIPTION"].iloc[0]
+    assert claude["金額種別"] == "本体+手数料"
+    assert int(claude["日付ズレ日数"]) == 1
+    assert claude["取引No"] == "101"

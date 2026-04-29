@@ -121,53 +121,61 @@ def reconcile_card(
 ) -> tuple[CardReport, MatchResult]:
     """1カード分を照合し、CardReport と生の MatchResult を返す。
 
-    profile.fee_cols が指定されている場合、パス1（本体金額のみ）で残った debit_only に対し、
-    パス2（本体+手数料の合算金額）で再照合する。
+    日付の近さを最優先するため、各段階（日付ズレ日数）を外側ループ、
+    金額戦略（本体 / 本体+手数料）を内側ループとして処理する。
+    profile.fee_cols 未指定時は本体のみのループとなり、従来挙動と一致する。
     """
     debit_all = profile.load_debit()
     debit_target, pending, declined = _filter_by_status(debit_all, profile)
 
     journal_scope = _journal_card_scope(journal, profile)
 
-    # パス1：本体金額のみで段階マッチング
-    pass1 = match(
-        debit_target, journal_scope,
-        debit_date_col=profile.date_col,
-        debit_amount_col=profile.amount_col,
-        date_tolerance_days=profile.date_tolerance_days,
-    )
-    matched_chunks = [_tag_amount_kind(pass1.matched, "本体")]
-    duplicates_chunks = [_tag_amount_kind(pass1.duplicates, "本体")]
-    debit_only_remaining = pass1.debit_only
-    journal_only_remaining = pass1.journal_only
+    matched_chunks: list[pd.DataFrame] = []
+    duplicates_chunks: list[pd.DataFrame] = []
+    debit_remaining = debit_target
+    journal_remaining = journal_scope
 
-    # パス2：本体+手数料の合算金額で再照合（fee_cols 指定時のみ）
-    if profile.fee_cols and not debit_only_remaining.empty:
-        debit_with_fee = _build_fee_inclusive_debit(debit_only_remaining, profile)
-        if not debit_with_fee.empty:
-            pass2 = match(
-                debit_with_fee, journal_only_remaining,
-                debit_date_col=profile.date_col,
-                debit_amount_col=profile.amount_col,
-                date_tolerance_days=profile.date_tolerance_days,
-            )
-            # パス2でマッチした行は元の金額列に戻してから出力する
-            pass2_matched     = _restore_original_amount(pass2.matched,     profile.amount_col)
-            pass2_duplicates  = _restore_original_amount(pass2.duplicates,  profile.amount_col)
-            pass2_debit_only  = _restore_original_amount(pass2.debit_only,  profile.amount_col)
-            matched_chunks.append(_tag_amount_kind(pass2_matched, "本体+手数料"))
-            duplicates_chunks.append(_tag_amount_kind(pass2_duplicates, "本体+手数料"))
-            # パス2対象外（手数料0の行）と パス2でも未消化の行を再合流
-            debit_excluded = debit_only_remaining[
-                ~debit_only_remaining.index.isin(debit_with_fee.index)
-            ]
-            debit_only_remaining = pd.concat(
-                [debit_excluded, pass2_debit_only], ignore_index=True,
-            )
-            journal_only_remaining = pass2.journal_only
+    for offset in range(profile.date_tolerance_days + 1):
+        # 段階内ステップ1：本体金額でマッチ
+        body = match(
+            debit_remaining, journal_remaining,
+            debit_date_col=profile.date_col,
+            debit_amount_col=profile.amount_col,
+            offsets=[offset],
+        )
+        matched_chunks.append(_tag_amount_kind(body.matched, "本体"))
+        duplicates_chunks.append(_tag_amount_kind(body.duplicates, "本体"))
+        debit_remaining = body.debit_only
+        journal_remaining = body.journal_only
+
+        # 段階内ステップ2：本体+手数料 でマッチ（fee_cols 指定時のみ）
+        if profile.fee_cols and not debit_remaining.empty:
+            debit_with_fee = _build_fee_inclusive_debit(debit_remaining, profile)
+            if not debit_with_fee.empty:
+                fee = match(
+                    debit_with_fee, journal_remaining,
+                    debit_date_col=profile.date_col,
+                    debit_amount_col=profile.amount_col,
+                    offsets=[offset],
+                )
+                fee_matched     = _restore_original_amount(fee.matched,     profile.amount_col)
+                fee_duplicates  = _restore_original_amount(fee.duplicates,  profile.amount_col)
+                fee_debit_only  = _restore_original_amount(fee.debit_only,  profile.amount_col)
+                matched_chunks.append(_tag_amount_kind(fee_matched, "本体+手数料"))
+                duplicates_chunks.append(_tag_amount_kind(fee_duplicates, "本体+手数料"))
+                # 手数料=0 で fee 対象外だった行と、fee でも未消化の行を再合流
+                debit_excluded = debit_remaining[
+                    ~debit_remaining.index.isin(debit_with_fee.index)
+                ]
+                debit_remaining = pd.concat(
+                    [debit_excluded, fee_debit_only], ignore_index=True,
+                )
+                journal_remaining = fee.journal_only
 
     matched_all     = _concat_nonempty(matched_chunks)
     duplicates_all  = _concat_nonempty(duplicates_chunks)
+    debit_only_remaining = debit_remaining
+    journal_only_remaining = journal_remaining
 
     matched_df    = _add_account(matched_all, profile.merchant_col, rules)
     debit_only_df = _add_account(debit_only_remaining, profile.merchant_col, rules)

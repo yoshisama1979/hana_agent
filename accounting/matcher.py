@@ -72,13 +72,19 @@ def match(
     debit_date_col: str = "利用日",
     debit_amount_col: str = "金額",
     date_tolerance_days: int = 0,
+    offsets: list[int] | None = None,
 ) -> MatchResult:
     """カード明細と仕訳帳を金額＋日付で照合し、MatchResult を返す。
 
     debit_date_col / debit_amount_col でカード固有のカラム名を指定できる。
     date_tolerance_days > 0 を指定すると、日付ズレ0日 → 1日 → ... → N日 と
     段階的にマッチングを行い、ズレの少ないペアから順に消化する。
+
+    offsets を指定すると、その値リストの順序でマッチングを行う。
+    たとえば offsets=[0] で段階0のみ、offsets=[2] で段階2のみ実行する。
+    呼び出し側で「段階×戦略」の入れ子ループを構成する用途で使う。
     """
+    iter_offsets = offsets if offsets is not None else range(date_tolerance_days + 1)
     r = debit.copy().reset_index(drop=True)
     j = journal.copy().reset_index(drop=True)
 
@@ -94,7 +100,7 @@ def match(
     used_r: set = set()
     used_j: set = set()
 
-    for offset in range(date_tolerance_days + 1):
+    for offset in iter_offsets:
         r_remaining = r[~r.index.isin(used_r)]
         j_remaining = j[~j.index.isin(used_j)]
         if r_remaining.empty or j_remaining.empty:

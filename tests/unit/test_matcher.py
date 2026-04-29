@@ -363,3 +363,75 @@ def test_match_keeps_unmatched_beyond_tolerance():
     assert len(result.matched) == 0
     assert len(result.debit_only) == 1
     assert len(result.journal_only) == 1
+
+
+# ---------------------------------------------------------------------------
+# M-A1: offsets=[0] 指定で段階0のみ実行され、段階1以降は処理されない
+# ---------------------------------------------------------------------------
+def test_match_with_offsets_zero_only_skips_higher_stages():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "ONE_DAY_OFF", "お取引金額": "1000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/16", "借方金額(円)": "1000", "摘要": "1日違い"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        offsets=[0],
+    )
+
+    # offset=0 のみ → 1日違いはマッチしない
+    assert len(result.matched) == 0
+    assert len(result.debit_only) == 1
+
+
+# ---------------------------------------------------------------------------
+# M-A2: offsets=[2] 指定で段階2のみ実行され、段階0/1 は処理されない
+# ---------------------------------------------------------------------------
+def test_match_with_offsets_specific_value_runs_only_that_stage():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "EXACT", "お取引金額": "1000"},
+        {"お取引日": "2025/04/15", "お取引内容": "TWO_DAY_OFF", "お取引金額": "2000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/15", "借方金額(円)": "1000", "摘要": "完全一致"},
+        {"取引日": "2025/04/17", "借方金額(円)": "2000", "摘要": "2日違い"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        offsets=[2],
+    )
+
+    # offset=2 のみ → 完全一致は無視され、2日違いのみマッチ
+    assert len(result.matched) == 1
+    assert int(result.matched.iloc[0]["日付ズレ日数"]) == 2
+    assert len(result.debit_only) == 1  # EXACT が残る
+
+
+# ---------------------------------------------------------------------------
+# M-A3: offsets 未指定なら従来通り range(date_tolerance_days+1) を使う（後方互換）
+# ---------------------------------------------------------------------------
+def test_match_without_offsets_uses_date_tolerance_days_default():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "EXACT", "お取引金額": "1000"},
+        {"お取引日": "2025/04/15", "お取引内容": "ONE_DAY_OFF", "お取引金額": "2000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/15", "借方金額(円)": "1000", "摘要": "完全一致"},
+        {"取引日": "2025/04/16", "借方金額(円)": "2000", "摘要": "1日違い"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=1,
+    )
+
+    assert len(result.matched) == 2
