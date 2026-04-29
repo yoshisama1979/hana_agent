@@ -79,30 +79,52 @@ def reconcile_receivables(journal: pd.DataFrame) -> ReceivableMatchResult:
             (deposits["_subj"] == subj) & (deposits["_amt"] == amt)
         ].sort_values("_dt").reset_index(drop=True)
 
-        used_deposit_idx: set[int] = set()
-        for _, inv in invoice_group.iterrows():
-            for d_idx, dep in deposit_group.iterrows():
-                if d_idx in used_deposit_idx:
-                    continue
-                if pd.isna(inv["_dt"]) or pd.isna(dep["_dt"]):
-                    continue
-                if dep["_dt"] <= inv["_dt"]:
-                    continue
-                pair_rows.append({
-                    "請求_取引No": str(inv["取引No"]),
-                    "請求_取引日": inv["取引日"],
-                    "請求_借方金額(円)": inv["借方金額(円)"],
-                    "補助科目": subj,
-                    "請求_摘要": inv.get("摘要", ""),
-                    "入金_取引No": str(dep["取引No"]),
-                    "入金_取引日": dep["取引日"],
-                    "入金_貸方金額(円)": dep["貸方金額(円)"],
-                    "入金_摘要": dep.get("摘要", ""),
-                })
-                consumed.add(str(inv["取引No"]))
-                consumed.add(str(dep["取引No"]))
-                used_deposit_idx.add(d_idx)
-                break
+        pairs, group_consumed = _pair_chronologically(
+            invoice_group, deposit_group, subj,
+        )
+        pair_rows.extend(pairs)
+        consumed |= group_consumed
 
     matched_df = pd.DataFrame(pair_rows) if pair_rows else pd.DataFrame()
     return ReceivableMatchResult(matched=matched_df, consumed_journal_nos=consumed)
+
+
+def _pair_chronologically(
+    invoice_group: pd.DataFrame,
+    deposit_group: pd.DataFrame,
+    subaccount: str,
+) -> tuple[list[dict], set[str]]:
+    """1グループ（同じ補助科目+金額）内で、請求と入金を取引日昇順に1:1ペアリングする。
+
+    各請求に対し、その日付より「後」で未消費の入金を最も近い順に1件選ぶ。
+    入金日 ≦ 請求日 はペアにしない。
+    """
+    pairs: list[dict] = []
+    consumed: set[str] = set()
+    used_deposit_idx: set[int] = set()
+
+    for _, inv in invoice_group.iterrows():
+        for d_idx, dep in deposit_group.iterrows():
+            if d_idx in used_deposit_idx:
+                continue
+            if pd.isna(inv["_dt"]) or pd.isna(dep["_dt"]):
+                continue
+            if dep["_dt"] <= inv["_dt"]:
+                continue
+            pairs.append({
+                "請求_取引No": str(inv["取引No"]),
+                "請求_取引日": inv["取引日"],
+                "請求_借方金額(円)": inv["借方金額(円)"],
+                "補助科目": subaccount,
+                "請求_摘要": inv.get("摘要", ""),
+                "入金_取引No": str(dep["取引No"]),
+                "入金_取引日": dep["取引日"],
+                "入金_貸方金額(円)": dep["貸方金額(円)"],
+                "入金_摘要": dep.get("摘要", ""),
+            })
+            consumed.add(str(inv["取引No"]))
+            consumed.add(str(dep["取引No"]))
+            used_deposit_idx.add(d_idx)
+            break
+
+    return pairs, consumed
