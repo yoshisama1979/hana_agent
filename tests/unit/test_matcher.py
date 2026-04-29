@@ -111,3 +111,41 @@ def test_match_returns_journal_only_when_no_risona_entry():
     # Then
     assert len(result.journal_only) == 1
     assert len(result.matched) == 1
+
+
+# ---------------------------------------------------------------------------
+# S5: りそな金額がマイナス（返金）でも仕訳帳の正値と絶対値で照合する
+# ---------------------------------------------------------------------------
+def test_match_pairs_negative_risona_amount_with_positive_journal_amount():
+    # Given: りそなは返金で-83824、仕訳帳は借方/貸方で方向を表現し金額は正値
+    risona = _risona([
+        {"利用日": "2025年10月22日", "利用内容": "CROWDWORKS", "金額": "-83824"}
+    ])
+    journal = _journal([
+        {"取引日": "2025/10/22", "借方金額(円)": "83824", "摘要": "VISAデビ 0857360A"}
+    ])
+
+    # When
+    result = match(risona, journal)
+
+    # Then
+    assert len(result.matched) == 1
+    assert len(result.risona_only) == 0
+    assert len(result.journal_only) == 0
+
+
+# ---------------------------------------------------------------------------
+# S6: 金額にカンマが含まれていても整数として比較する
+# ---------------------------------------------------------------------------
+def test_match_handles_comma_separated_amount():
+    # Given: 仕訳帳側にカンマ区切りの金額が入る場合
+    risona = _risona([{"利用日": "2025年04月07日", "利用内容": "ZOOM", "金額": "4968"}])
+    journal = _journal([
+        {"取引日": "2025/04/07", "借方金額(円)": "4,968", "摘要": "VISAデビ 0000001A"}
+    ])
+
+    # When
+    result = match(risona, journal)
+
+    # Then
+    assert len(result.matched) == 1

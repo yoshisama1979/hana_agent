@@ -1,6 +1,6 @@
 .env
 !.env.example
-accounting/data/
+data/
 __pycache__/
 .python-version
 main.py

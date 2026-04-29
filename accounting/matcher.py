@@ -31,16 +31,32 @@ def _normalize_date(series: pd.Series) -> pd.Series:
     return series.apply(_to_iso)
 
 
+def _normalize_amount(series: pd.Series) -> pd.Series:
+    """金額を符号なし整数文字列に正規化する。
+
+    りそな明細は返金がマイナス値、仕訳帳は借方/貸方で方向を表現し金額は正値、
+    という表記差があるため絶対値で比較する。
+    """
+    return (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .astype(int)
+        .abs()
+        .astype(str)
+    )
+
+
 def match(risona: pd.DataFrame, journal: pd.DataFrame) -> MatchResult:
     """りそな明細と仕訳帳を金額＋日付で照合し、MatchResult を返す。"""
     r = risona.copy()
     j = journal.copy()
 
     r["_date"] = _normalize_date(r["利用日"])
-    r["_amount"] = r["金額"].astype(str).str.strip()
+    r["_amount"] = _normalize_amount(r["金額"])
 
     j["_date"] = _normalize_date(j["取引日"])
-    j["_amount"] = j["借方金額(円)"].astype(str).str.strip()
+    j["_amount"] = _normalize_amount(j["借方金額(円)"])
 
     r["_key"] = r["_date"] + "_" + r["_amount"]
     j["_key"] = j["_date"] + "_" + j["_amount"]
