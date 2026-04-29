@@ -1,66 +1,229 @@
 """
 reconcile.py
 
-りそなデビット明細と仕訳帳を照合し、勘定科目を推定してCSVに書き出す
+複数のデビットカード明細と仕訳帳を照合し、勘定科目を推定してCSVに書き出す。
 
 使い方:
-  python -m accounting.reconcile [--journal PATH] [--debit PATH] [--rules PATH] [--output DIR]
+  python -m accounting.reconcile [--journal PATH] [--rules PATH] [--output DIR]
 
 省略時のデフォルト:
   --journal: data/accounting/仕訳帳.csv
-  --debit:   data/accounting/risona_debit.csv
   --rules:   accounting/rules/merchant_rules.yml
   --output:  data/accounting/output/
+
+明細CSVのパスは accounting/card_profiles.py の各 CardProfile で定義する。
 """
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
+from .card_profiles import PROFILES, CardProfile
 from .classifier import classify
-from .matcher import match
+from .matcher import MatchResult, match
 
 DEFAULT_JOURNAL = Path("data/accounting/仕訳帳.csv")
-DEFAULT_DEBIT   = Path("data/accounting/risona_debit.csv")
 DEFAULT_RULES   = Path("accounting/rules/merchant_rules.yml")
 DEFAULT_OUTPUT  = Path("data/accounting/output")
 
-# 仕訳帳のVISAデビ候補抽出条件
-# - 借方/貸方の補助科目がこの口座のもの
-# - かつ反対側の勘定科目が「普通預金/現金」以外（口座間振替・現金引出を除外）
-RISONA_ACCOUNT = "りそな銀行大手支店普通0073514"
+# 仕訳帳のカード照合スコープから除外する反対側勘定科目
 NON_VISA_OPPOSITE = {"普通預金", "現金"}
 
-# りそな明細のステータス分類
-# 「確定」のみが仕訳化対象。それ以外は仕訳に入らないので照合対象外として別出力する。
-RISONA_STATUS_TARGET   = "確定"
-RISONA_STATUS_DECLINED = "決済不可"
+# りそな等のステータス列を持つカードでの分類
+STATUS_TARGET   = "確定"
+STATUS_DECLINED = "決済不可"
 
+# カード_照合済み_コンパクト.csv のカラム順
+# りそな由来とSBI由来でカラム名が異なるため、両方を列挙して存在分のみ抽出する
 COMPACT_COLS = [
-    "利用日", "利用内容", "利用内容（入力）", "金額", "承認番号", "ステータス",
-    "取引No", "取引日", "借方勘定科目", "借方勘定科目（入力）", "補助科目（入力）", "借方金額(円)",
+    # 共通：仕訳帳側
+    "取引No", "取引日",
+    # 明細側（カード固有）
+    "利用日", "利用内容", "金額", "承認番号", "ステータス",        # りそな
+    "お取引日", "お取引内容", "お取引金額",                         # SBI
+    "利用内容（入力）",
+    "借方勘定科目", "借方勘定科目（入力）", "補助科目（入力）", "借方金額(円)",
     "貸方勘定科目", "貸方補助科目", "貸方金額(円)", "摘要",
     "要目視確認",
 ]
 
 
-def add_account(df: pd.DataFrame, rules: list) -> pd.DataFrame:
+@dataclass
+class CardReport:
+    profile: CardProfile
+    matched: pd.DataFrame
+    duplicates: pd.DataFrame
+    debit_only: pd.DataFrame
+    pending: pd.DataFrame    # 未確定（ステータスありのみ）
+    declined: pd.DataFrame   # 決済不可（ステータスありのみ）
+
+    @property
+    def consumed_journal_nos(self) -> set[str]:
+        """仕訳帳のみ.csv 集計のために除外する取引No集合"""
+        nos: set[str] = set()
+        for df in (self.matched, self.duplicates):
+            if not df.empty and "取引No" in df.columns:
+                nos.update(df["取引No"].astype(str))
+        return nos
+
+
+def _add_account(df: pd.DataFrame, merchant_col: str, rules: list) -> pd.DataFrame:
+    """利用内容カラムから勘定科目を推定し、列を追加する"""
     if df.empty:
         return df
-    classified = df["利用内容"].apply(lambda m: classify(m, rules))
+    classified = df[merchant_col].apply(lambda m: classify(m, rules))
     df = df.copy()
     df["推定入力名"]   = classified.apply(lambda c: c["入力名"])
     df["推定勘定科目"] = classified.apply(lambda c: c["勘定科目"])
     df["推定補助科目"] = classified.apply(lambda c: c["補助科目"])
     df["推定税区分"]   = classified.apply(lambda c: c["税区分"])
-    matched = df["推定勘定科目"] != "★要確認"
+    matched = df["推定勘定科目"] != "★ルール未登録"
     df["利用内容（入力）"]     = df["推定入力名"].where(matched, "")
     df["借方勘定科目（入力）"] = df["推定勘定科目"].where(matched, "")
     df["補助科目（入力）"]     = df["推定補助科目"].where(matched, "")
     return df
+
+
+def _filter_by_status(
+    debit_all: pd.DataFrame, profile: CardProfile,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """ステータスで明細を確定/未確定/決済不可に振り分ける。
+    ステータス列のないカードは debit_all をそのまま「確定」、他は空 DataFrame を返す。
+    """
+    if not profile.has_status or "ステータス" not in debit_all.columns:
+        return debit_all.reset_index(drop=True), pd.DataFrame(), pd.DataFrame()
+
+    status = debit_all["ステータス"]
+    target   = debit_all[status == STATUS_TARGET].reset_index(drop=True)
+    declined = debit_all[status == STATUS_DECLINED].reset_index(drop=True)
+    pending  = debit_all[
+        ~status.isin({STATUS_TARGET, STATUS_DECLINED})
+    ].reset_index(drop=True)
+    return target, pending, declined
+
+
+def _journal_card_scope(journal: pd.DataFrame, profile: CardProfile) -> pd.DataFrame:
+    """指定カードの照合対象となる仕訳帳行（反対側が普通預金/現金以外）を抽出"""
+    is_debit  = journal["借方補助科目"] == profile.account_name
+    is_credit = journal["貸方補助科目"] == profile.account_name
+    return journal[
+        (is_debit  & ~journal["貸方勘定科目"].isin(NON_VISA_OPPOSITE)) |
+        (is_credit & ~journal["借方勘定科目"].isin(NON_VISA_OPPOSITE))
+    ].reset_index(drop=True)
+
+
+def reconcile_card(
+    profile: CardProfile, journal: pd.DataFrame, rules: list,
+) -> tuple[CardReport, MatchResult]:
+    """1カード分を照合し、CardReport と生の MatchResult を返す"""
+    debit_all = profile.load_debit()
+    debit_target, pending, declined = _filter_by_status(debit_all, profile)
+
+    journal_scope = _journal_card_scope(journal, profile)
+
+    result = match(
+        debit_target, journal_scope,
+        debit_date_col=profile.date_col,
+        debit_amount_col=profile.amount_col,
+    )
+
+    matched_df    = _add_account(result.matched,    profile.merchant_col, rules)
+    debit_only_df = _add_account(result.debit_only, profile.merchant_col, rules)
+
+    report = CardReport(
+        profile=profile,
+        matched=matched_df,
+        duplicates=result.duplicates,
+        debit_only=debit_only_df,
+        pending=pending,
+        declined=declined,
+    )
+    return report, result
+
+
+def _write_card_outputs(report: CardReport, output_dir: Path) -> None:
+    """1カード分の出力CSVを output_dir/<card_id>/ 配下に書き出す"""
+    card_dir = output_dir / report.profile.card_id
+    card_dir.mkdir(parents=True, exist_ok=True)
+
+    files: dict[str, pd.DataFrame] = {
+        "カード_照合済み.csv":   report.matched,
+        "カード_重複要確認.csv": report.duplicates,
+        "カード_未入力.csv":     report.debit_only,
+    }
+    if report.profile.has_status:
+        files["カード_未確定.csv"] = report.pending
+        files["カード_対象外.csv"] = report.declined
+
+    for filename, df in files.items():
+        path = card_dir / filename
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        print(f"[{report.profile.card_id}] {filename}: {len(df)} 件 → {path}")
+
+    if not report.matched.empty:
+        cols = [c for c in COMPACT_COLS if c in report.matched.columns]
+        compact_path = card_dir / "カード_照合済み_コンパクト.csv"
+        report.matched[cols].sort_values("取引日").to_csv(
+            compact_path, index=False, encoding="utf-8-sig",
+        )
+        print(
+            f"[{report.profile.card_id}] カード_照合済み_コンパクト.csv: "
+            f"{len(report.matched)} 件 → {compact_path}"
+        )
+
+
+def _print_summary(reports: list[CardReport], journal_only_count: int) -> None:
+    print()
+    for report in reports:
+        issues = {
+            "カード_重複要確認": len(report.duplicates),
+            "カード_未入力":     len(report.debit_only),
+        }
+        total = sum(issues.values())
+        if total == 0:
+            print(f"カード照合({report.profile.card_id}): 〇 すべて照合済み")
+        else:
+            breakdown = ", ".join(f"{k} {v}件" for k, v in issues.items() if v > 0)
+            print(
+                f"カード照合({report.profile.card_id}): × 未解決 {total}件（{breakdown}）"
+            )
+    print(f"仕訳帳のみ: {journal_only_count}件（カード照合外・他ツールでの照合待ち）")
+
+
+def run(
+    *,
+    profiles: list[CardProfile],
+    journal: Path,
+    rules: Path,
+    output: Path,
+) -> list[CardReport]:
+    """全カードを順に照合し、結果CSVを output 配下に書き出す"""
+    journal_df = pd.read_csv(journal, encoding="cp932", dtype=str).fillna("")
+    rules_list = yaml.safe_load(rules.read_text(encoding="utf-8"))["rules"]
+
+    output.mkdir(parents=True, exist_ok=True)
+
+    reports: list[CardReport] = []
+    consumed_nos: set[str] = set()
+    for profile in profiles:
+        report, _ = reconcile_card(profile, journal_df, rules_list)
+        _write_card_outputs(report, output)
+        reports.append(report)
+        consumed_nos |= report.consumed_journal_nos
+
+    journal_remaining = journal_df[
+        ~journal_df["取引No"].astype(str).isin(consumed_nos)
+    ].reset_index(drop=True)
+    journal_only_path = output / "仕訳帳のみ.csv"
+    journal_remaining.to_csv(journal_only_path, index=False, encoding="utf-8-sig")
+    print(f"仕訳帳のみ.csv: {len(journal_remaining)} 件 → {journal_only_path}")
+
+    _print_summary(reports, len(journal_remaining))
+    return reports
 
 
 def main() -> None:
@@ -70,90 +233,22 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="python -m accounting.reconcile",
-        description="りそなデビット明細と仕訳帳を照合し、勘定科目を推定してCSVに書き出す",
+        description="複数のデビットカード明細と仕訳帳を照合し、勘定科目を推定してCSVに書き出す",
     )
     parser.add_argument("--journal", type=Path, default=DEFAULT_JOURNAL,
                         help=f"freee仕訳帳CSV (default: {DEFAULT_JOURNAL})")
-    parser.add_argument("--debit", type=Path, default=DEFAULT_DEBIT,
-                        help=f"りそなデビット明細CSV (default: {DEFAULT_DEBIT})")
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES,
                         help=f"勘定科目ルールYAML (default: {DEFAULT_RULES})")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
                         help=f"出力ディレクトリ (default: {DEFAULT_OUTPUT})")
     args = parser.parse_args()
 
-    risona_all = pd.read_csv(args.debit,   encoding="cp932", dtype=str).fillna("")
-    journal    = pd.read_csv(args.journal, encoding="cp932", dtype=str).fillna("")
-    rules      = yaml.safe_load(args.rules.read_text(encoding="utf-8"))["rules"]
-
-    status = risona_all["ステータス"]
-    risona          = risona_all[status == RISONA_STATUS_TARGET].reset_index(drop=True)
-    risona_declined = risona_all[status == RISONA_STATUS_DECLINED].reset_index(drop=True)
-    risona_pending  = risona_all[
-        ~status.isin({RISONA_STATUS_TARGET, RISONA_STATUS_DECLINED})
-    ].reset_index(drop=True)
-
-    # カード照合のスコープ：りそな普通預金が片側、反対側が普通預金/現金以外
-    is_risona_debit  = journal["借方補助科目"] == RISONA_ACCOUNT
-    is_risona_credit = journal["貸方補助科目"] == RISONA_ACCOUNT
-    journal_card_scope = journal[
-        (is_risona_debit  & ~journal["貸方勘定科目"].isin(NON_VISA_OPPOSITE)) |
-        (is_risona_credit & ~journal["借方勘定科目"].isin(NON_VISA_OPPOSITE))
-    ].reset_index(drop=True)
-
-    result = match(risona, journal_card_scope)
-
-    args.output.mkdir(parents=True, exist_ok=True)
-
-    matched_df = add_account(result.matched, rules)
-
-    # カード照合で消化された取引Noを集計
-    consumed_nos: set[str] = set()
-    for df in (matched_df, result.duplicates):
-        if not df.empty:
-            consumed_nos.update(df["取引No"].astype(str))
-
-    # 仕訳帳のみ = 全仕訳帳 - カード照合で消化された取引No
-    journal_remaining = journal[
-        ~journal["取引No"].astype(str).isin(consumed_nos)
-    ].reset_index(drop=True)
-
-    files = {
-        "カード_照合済み.csv":   matched_df,
-        "カード_重複要確認.csv": result.duplicates,
-        "カード_未入力.csv":     add_account(result.risona_only, rules),
-        "カード_未確定.csv":     risona_pending,
-        "カード_対象外.csv":     risona_declined,
-        "仕訳帳のみ.csv":         journal_remaining,
-    }
-
-    for filename, df in files.items():
-        path = args.output / filename
-        df.to_csv(path, index=False, encoding="utf-8-sig")
-        print(f"{filename}: {len(df)} 件 → {path}")
-
-    if not matched_df.empty:
-        cols = [c for c in COMPACT_COLS if c in matched_df.columns]
-        compact_path = args.output / "カード_照合済み_コンパクト.csv"
-        matched_df[cols].sort_values("取引日").to_csv(
-            compact_path, index=False, encoding="utf-8-sig"
-        )
-        print(f"カード_照合済み_コンパクト.csv: {len(matched_df)} 件 → {compact_path}")
-
-    # --- 最終評価 ---
-    # カード照合の完了判定（重複要確認・未入力が両方0なら〇）
-    card_issues = {
-        "カード_重複要確認": len(result.duplicates),
-        "カード_未入力":     len(result.risona_only),
-    }
-    card_total = sum(card_issues.values())
-    print()
-    if card_total == 0:
-        print("カード照合: 〇 すべて照合済み")
-    else:
-        breakdown = ", ".join(f"{k} {v}件" for k, v in card_issues.items() if v > 0)
-        print(f"カード照合: × 未解決 {card_total}件（{breakdown}）")
-    print(f"仕訳帳のみ: {len(journal_remaining)}件（カード照合外・他ツールでの照合待ち）")
+    run(
+        profiles=list(PROFILES.values()),
+        journal=args.journal,
+        rules=args.rules,
+        output=args.output,
+    )
 
 
 if __name__ == "__main__":

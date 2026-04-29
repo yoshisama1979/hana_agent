@@ -37,9 +37,10 @@ def test_classify_matches_fullwidth_text_via_normalization():
 
 
 # ---------------------------------------------------------------------------
-# S7: どのルールにもマッチしない場合は★要確認とする
+# S7: どのルールにもマッチしない場合は★ルール未登録とする
+# 仕訳帳側で freee が入れる「★要確認」と区別するためのフラグ。
 # ---------------------------------------------------------------------------
-def test_classify_returns_unconfirmed_when_no_rule_matches():
+def test_classify_returns_unregistered_when_no_rule_matches():
     # Given
     merchant = "UNKNOWN SHOP"
 
@@ -47,4 +48,4 @@ def test_classify_returns_unconfirmed_when_no_rule_matches():
     result = classify(merchant, RULES)
 
     # Then
-    assert result["勘定科目"] == "★要確認"
+    assert result["勘定科目"] == "★ルール未登録"

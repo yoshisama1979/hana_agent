@@ -28,7 +28,7 @@ def test_match_returns_matched_when_amount_and_date_match():
 
     # Then
     assert len(result.matched) == 1
-    assert len(result.risona_only) == 0
+    assert len(result.debit_only) == 0
     assert len(result.journal_only) == 0
 
 
@@ -73,7 +73,7 @@ def test_match_returns_duplicates_when_counts_differ():
 
     # Then
     assert len(result.duplicates) == 1
-    assert len(result.risona_only) == 1
+    assert len(result.debit_only) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ def test_match_returns_risona_only_when_no_journal_entry():
     result = match(risona, journal)
 
     # Then
-    assert len(result.risona_only) == 1
+    assert len(result.debit_only) == 1
     assert len(result.matched) == 0
 
 
@@ -130,7 +130,7 @@ def test_match_pairs_negative_risona_amount_with_positive_journal_amount():
 
     # Then
     assert len(result.matched) == 1
-    assert len(result.risona_only) == 0
+    assert len(result.debit_only) == 0
     assert len(result.journal_only) == 0
 
 
@@ -148,4 +148,49 @@ def test_match_handles_comma_separated_amount():
     result = match(risona, journal)
 
     # Then
+    assert len(result.matched) == 1
+
+
+# ---------------------------------------------------------------------------
+# S7: 明細側のカラム名を引数で指定すると、SBIのような別カラム構成でも照合できる
+# ---------------------------------------------------------------------------
+def test_match_accepts_custom_debit_columns_for_sbi():
+    # Given: SBIは「お取引日」「お取引金額」、金額は小数文字列
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/29", "お取引内容": "APPLE COM BILL", "お取引金額": "400.00"}
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/29", "借方金額(円)": "400", "摘要": "VISAデビ APPLE"}
+    ])
+
+    # When
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+    )
+
+    # Then
+    assert len(result.matched) == 1
+    assert len(result.debit_only) == 0
+    assert len(result.journal_only) == 0
+
+
+# ---------------------------------------------------------------------------
+# S8: 明細側のマイナス小数（返金）も絶対値で照合される
+# ---------------------------------------------------------------------------
+def test_match_handles_negative_decimal_amount():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/05/10", "お取引内容": "REFUND", "お取引金額": "-1500.00"}
+    ])
+    journal = _journal([
+        {"取引日": "2025/05/10", "借方金額(円)": "1500", "摘要": "返金"}
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+    )
+
     assert len(result.matched) == 1
