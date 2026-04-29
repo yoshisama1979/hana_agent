@@ -48,6 +48,15 @@ def _write_journal(path: Path) -> None:
          "借方勘定科目": "支払手数料", "借方補助科目": "", "借方金額(円)": "2953",
          "貸方勘定科目": "普通預金", "貸方補助科目": SBI_ACCOUNT, "貸方金額(円)": "2953",
          "摘要": "VERCEL INC."},
+        # 売掛金照合 ペア（請求 → 入金）
+        {"取引No": "6", "取引日": "2025/04/18",
+         "借方勘定科目": "売掛金", "借方補助科目": "株式会社A", "借方金額(円)": "100000",
+         "貸方勘定科目": "売上高", "貸方補助科目": "", "貸方金額(円)": "100000",
+         "摘要": "請求4月分"},
+        {"取引No": "7", "取引日": "2025/05/09",
+         "借方勘定科目": "普通預金", "借方補助科目": SBI_ACCOUNT, "借方金額(円)": "100000",
+         "貸方勘定科目": "売掛金", "貸方補助科目": "株式会社A", "貸方金額(円)": "100000",
+         "摘要": "入金4月分"},
     ])
     # 不足カラムは空で埋める（実ファイルに合わせる）
     for col in ["借方部門", "借方取引先", "借方税区分", "借方インボイス",
@@ -279,6 +288,38 @@ def test_journal_only_excludes_fee_inclusive_matches(setup_env):
     )
     nos = set(df["取引No"].astype(str))
     assert "5" not in nos  # パス2で消化されているので残ってはいけない
+
+
+# ---------------------------------------------------------------------------
+# F-05: 売掛金照合の出力先と消化分の仕訳帳のみからの除外
+# ---------------------------------------------------------------------------
+def test_receivable_reconciliation_writes_pair_csv(setup_env):
+    run(**setup_env)
+
+    pair_csv = setup_env["output"] / "receivable" / "売掛金_照合済み.csv"
+    assert pair_csv.exists()
+
+    df = pd.read_csv(pair_csv, encoding="utf-8-sig", dtype=str)
+    # 取引No 6（請求） と 7（入金） が1ペアになっている
+    assert len(df) == 1
+    pair = df.iloc[0]
+    assert pair["請求_取引No"] == "6"
+    assert pair["入金_取引No"] == "7"
+    assert pair["補助科目"] == "株式会社A"
+
+
+def test_receivable_consumed_rows_excluded_from_journal_only(setup_env):
+    run(**setup_env)
+
+    df = pd.read_csv(
+        setup_env["output"] / "仕訳帳のみ.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    nos = set(df["取引No"].astype(str))
+    # 売掛金照合で消化された請求・入金は仕訳帳のみから除外
+    assert "6" not in nos
+    assert "7" not in nos
 
 
 # ---------------------------------------------------------------------------

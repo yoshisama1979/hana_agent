@@ -25,6 +25,7 @@ import yaml
 from .card_profiles import PROFILES, CardProfile
 from .classifier import classify
 from .matcher import MatchResult, match
+from .receivable_reconcile import reconcile_receivables
 
 DEFAULT_JOURNAL = Path("data/accounting/仕訳帳.csv")
 DEFAULT_RULES   = Path("accounting/rules/merchant_rules.yml")
@@ -277,7 +278,11 @@ def _write_card_outputs(report: CardReport, output_dir: Path) -> None:
         )
 
 
-def _print_summary(reports: list[CardReport], journal_only_count: int) -> None:
+def _print_summary(
+    reports: list[CardReport],
+    journal_only_count: int,
+    receivable_matched_count: int = 0,
+) -> None:
     print()
     for report in reports:
         issues = {
@@ -312,7 +317,8 @@ def _print_summary(reports: list[CardReport], journal_only_count: int) -> None:
             if value > 0:
                 print(f"  {key}: {value}件")
 
-    print(f"仕訳帳のみ: {journal_only_count}件（カード照合外・他ツールでの照合待ち）")
+    print(f"売掛金照合: {receivable_matched_count}件 ペア消化")
+    print(f"仕訳帳のみ: {journal_only_count}件（他ツールでの照合待ち）")
 
 
 def run(
@@ -336,6 +342,11 @@ def run(
         reports.append(report)
         consumed_nos |= report.consumed_journal_nos
 
+    # F-05 売掛金照合：カード照合の後に仕訳帳内で 請求 ⇄ 入金 をペアリング
+    receivable_result = reconcile_receivables(journal_df)
+    _write_receivable_outputs(receivable_result.matched, output)
+    consumed_nos |= receivable_result.consumed_journal_nos
+
     journal_remaining = journal_df[
         ~journal_df["取引No"].astype(str).isin(consumed_nos)
     ].reset_index(drop=True)
@@ -343,8 +354,17 @@ def run(
     journal_remaining.to_csv(journal_only_path, index=False, encoding="utf-8-sig")
     print(f"仕訳帳のみ.csv: {len(journal_remaining)} 件 → {journal_only_path}")
 
-    _print_summary(reports, len(journal_remaining))
+    _print_summary(reports, len(journal_remaining), len(receivable_result.matched))
     return reports
+
+
+def _write_receivable_outputs(matched: pd.DataFrame, output_dir: Path) -> None:
+    """売掛金照合結果を output_dir/receivable/ 配下に書き出す"""
+    receivable_dir = output_dir / "receivable"
+    receivable_dir.mkdir(parents=True, exist_ok=True)
+    path = receivable_dir / "売掛金_照合済み.csv"
+    matched.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[receivable] 売掛金_照合済み.csv: {len(matched)} 件 → {path}")
 
 
 def main() -> None:
