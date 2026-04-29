@@ -47,11 +47,13 @@ def _normalize_amount(series: pd.Series) -> pd.Series:
     明細CSV側は返金がマイナス値、仕訳帳は借方/貸方で方向を表現し金額は正値、
     という表記差があるため絶対値で比較する。
     SBI明細は "400.00" のような小数表記なので float 経由で整数化する。
+    空文字（仕訳帳側で借方/貸方の片方しか金額を持たない行など）は 0 扱い。
     """
     return (
         series.astype(str)
         .str.replace(",", "", regex=False)
         .str.strip()
+        .replace("", "0")
         .astype(float)
         .abs()
         .astype(int)

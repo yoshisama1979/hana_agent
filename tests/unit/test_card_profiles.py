@@ -44,6 +44,29 @@ def test_risona_profile_is_defined():
     assert risona.date_tolerance_days == 0
     # りそなは海外取引時の手数料合算がない想定
     assert risona.fee_cols == ()
+    # 通常CSVなので header_marker/footer_marker は None
+    assert risona.header_marker is None
+    assert risona.footer_marker is None
+
+
+# ---------------------------------------------------------------------------
+# Q: ライフカードプロファイルが card_id="lifecard"、必要属性を持つ
+# ---------------------------------------------------------------------------
+def test_lifecard_profile_is_defined():
+    lifecard = PROFILES["lifecard"]
+    assert lifecard.card_id == "lifecard"
+    assert lifecard.account_name == "ミライノ カード(MasterCard)ミライノカード Bu"
+    assert lifecard.date_col == "利用日"
+    assert lifecard.amount_col == "利用金額"
+    assert lifecard.merchant_col == "利用先"
+    assert lifecard.has_status is False
+    # 同日マッチが大半なのでズレ許容は0
+    assert lifecard.date_tolerance_days == 0
+    # 海外手数料カラムは使わない（明細上の手数料は0件）
+    assert lifecard.fee_cols == ()
+    # 冒頭19行のメタ情報を読み飛ばすマーカ
+    assert lifecard.header_marker == "明細No."
+    assert lifecard.footer_marker == "回数指定払"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +83,115 @@ def test_card_profile_date_tolerance_default_is_zero():
         debit_pattern="dummy",
     )
     assert profile.date_tolerance_days == 0
+
+
+# ---------------------------------------------------------------------------
+# A-5: header_marker / footer_marker のデフォルトは None（後方互換）
+# ---------------------------------------------------------------------------
+def test_card_profile_marker_defaults_are_none():
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="金額",
+        merchant_col="利用内容",
+        has_status=False,
+        debit_pattern="dummy",
+    )
+    assert profile.header_marker is None
+    assert profile.footer_marker is None
+
+
+# ---------------------------------------------------------------------------
+# L-1: header_marker 指定時、そこから始まる行を CSV ヘッダーとして読む
+# 冒頭のメタ情報行（支払日や会員氏名）はスキップされる
+# ---------------------------------------------------------------------------
+def test_load_debit_skips_pre_header_meta_when_marker_set(tmp_path):
+    csv = tmp_path / "lifecard_meisai.csv"
+    csv.write_text(
+        "支払日,2025年04月28日\n"
+        "会員氏名,テスト 太郎\n"
+        "\n"
+        "明細No.,利用日,利用先,利用金額\n"
+        '"0001","2025/03/29","TEST SHOP","3455"\n',
+        encoding="cp932",
+    )
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="利用金額",
+        merchant_col="利用先",
+        has_status=False,
+        debit_pattern=str(csv),
+        header_marker="明細No.",
+    )
+
+    df = profile.load_debit()
+
+    assert len(df) == 1
+    assert list(df.columns) == ["明細No.", "利用日", "利用先", "利用金額"]
+    assert df.iloc[0]["利用先"] == "TEST SHOP"
+
+
+# ---------------------------------------------------------------------------
+# L-2: footer_marker 指定時、その行以降は無視される
+# ---------------------------------------------------------------------------
+def test_load_debit_truncates_at_footer_marker(tmp_path):
+    csv = tmp_path / "lifecard_meisai.csv"
+    csv.write_text(
+        "明細No.,利用日,利用先,利用金額\n"
+        '"0001","2025/03/29","SHOP A","1000"\n'
+        '"0002","2025/03/30","SHOP B","2000"\n'
+        "\n"
+        "回数指定払 内訳表\n"
+        "明細No.,お支払総額,ご利用金額\n"
+        '"0001","1000","1000"\n',
+        encoding="cp932",
+    )
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="利用金額",
+        merchant_col="利用先",
+        has_status=False,
+        debit_pattern=str(csv),
+        header_marker="明細No.",
+        footer_marker="回数指定払",
+    )
+
+    df = profile.load_debit()
+
+    # フッター内訳表は除外される
+    assert len(df) == 2
+    assert set(df["利用先"]) == {"SHOP A", "SHOP B"}
+
+
+# ---------------------------------------------------------------------------
+# L-3: header_marker が見つからない場合は ValueError
+# ---------------------------------------------------------------------------
+def test_load_debit_raises_when_header_marker_missing(tmp_path):
+    csv = tmp_path / "lifecard_meisai.csv"
+    csv.write_text(
+        "支払日,2025年04月28日\n"
+        "会員氏名,テスト 太郎\n",
+        encoding="cp932",
+    )
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="利用金額",
+        merchant_col="利用先",
+        has_status=False,
+        debit_pattern=str(csv),
+        header_marker="明細No.",
+    )
+
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="明細No\\."):
+        profile.load_debit()
 
 
 # ---------------------------------------------------------------------------
