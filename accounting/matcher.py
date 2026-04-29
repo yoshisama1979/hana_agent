@@ -5,12 +5,21 @@ from datetime import date
 import pandas as pd
 
 
+# 照合処理の中で一時的に付与する内部マーカ列。出力前に必ず drop する。
+_INTERNAL_COLS: list[str] = ["_date", "_amount", "_key", "_dt"]
+
+
 @dataclass
 class MatchResult:
     matched: pd.DataFrame = field(default_factory=pd.DataFrame)
     duplicates: pd.DataFrame = field(default_factory=pd.DataFrame)
     debit_only: pd.DataFrame = field(default_factory=pd.DataFrame)
     journal_only: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """空でない DataFrame リストを結合する。空なら空 DataFrame を返す。"""
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _normalize_date(series: pd.Series) -> pd.Series:
@@ -80,8 +89,6 @@ def match(
     r["_dt"] = r["_date"].apply(_to_date)
     j["_dt"] = j["_date"].apply(_to_date)
 
-    drop_cols = ["_date", "_amount", "_key", "_dt"]
-
     matched_chunks: list[pd.DataFrame] = []
     dup_chunks: list[pd.DataFrame] = []
     used_r: set = set()
@@ -95,11 +102,11 @@ def match(
 
         if offset == 0:
             stage_matched, stage_dup, paired_r, paired_j = _match_exact(
-                r_remaining, j_remaining, drop_cols,
+                r_remaining, j_remaining,
             )
         else:
             stage_matched, stage_dup, paired_r, paired_j = _match_with_offset(
-                r_remaining, j_remaining, offset, drop_cols,
+                r_remaining, j_remaining, offset,
             )
 
         for df in (stage_matched, stage_dup):
@@ -114,11 +121,8 @@ def match(
         used_r.update(paired_r)
         used_j.update(paired_j)
 
-    debit_only = r[~r.index.isin(used_r)].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
-    journal_only = j[~j.index.isin(used_j)].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
-
-    def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    debit_only = r[~r.index.isin(used_r)].drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
+    journal_only = j[~j.index.isin(used_j)].drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
 
     return MatchResult(
         matched=_concat(matched_chunks),
@@ -129,7 +133,7 @@ def match(
 
 
 def _match_exact(
-    r: pd.DataFrame, j: pd.DataFrame, drop_cols: list[str],
+    r: pd.DataFrame, j: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list, list]:
     """段階0：同日・同金額でグループ化し、件数一致なら 1:1 / N:N、不一致は重複要確認。"""
     r = r.copy()
@@ -147,8 +151,8 @@ def _match_exact(
         j_rows = j[j["_key"] == key]
         rc, jc = len(r_rows), len(j_rows)
 
-        r_clean = r_rows.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
-        j_clean = j_rows.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+        r_clean = r_rows.drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
+        j_clean = j_rows.drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
 
         if rc == jc:
             needs_review = rc > 1
@@ -178,14 +182,11 @@ def _match_exact(
                 paired_r.extend(r_rows.index.tolist()[:n])
                 paired_j.extend(j_rows.index.tolist())
 
-    def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
     return _concat(matched_rows), _concat(dup_rows), paired_r, paired_j
 
 
 def _match_with_offset(
-    r: pd.DataFrame, j: pd.DataFrame, offset: int, drop_cols: list[str],
+    r: pd.DataFrame, j: pd.DataFrame, offset: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list, list]:
     """段階1以上：金額一致＆|日付差|==offset の行同士を greedy に1:1ペアリング。"""
     matched_rows: list[pd.DataFrame] = []
@@ -201,8 +202,8 @@ def _match_with_offset(
                 continue
             if abs((r_row["_dt"] - j_row["_dt"]).days) != offset:
                 continue
-            r_clean = r.loc[[r_idx]].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
-            j_clean = j.loc[[j_idx]].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+            r_clean = r.loc[[r_idx]].drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
+            j_clean = j.loc[[j_idx]].drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
             pair = r_clean.join(j_clean, rsuffix="_journal")
             pair["要目視確認"] = ""
             matched_rows.append(pair)
@@ -211,5 +212,4 @@ def _match_with_offset(
             used_j_idx.add(j_idx)
             break
 
-    matched = pd.concat(matched_rows, ignore_index=True) if matched_rows else pd.DataFrame()
-    return matched, pd.DataFrame(), paired_r, paired_j
+    return _concat(matched_rows), pd.DataFrame(), paired_r, paired_j
