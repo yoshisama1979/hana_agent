@@ -143,9 +143,7 @@ def reconcile_card(
 
     # パス2：本体+手数料の合算金額で再照合（fee_cols 指定時のみ）
     if profile.fee_cols and not debit_only_remaining.empty:
-        debit_with_fee, original_amount_col_backup = _build_fee_inclusive_debit(
-            debit_only_remaining, profile,
-        )
+        debit_with_fee = _build_fee_inclusive_debit(debit_only_remaining, profile)
         if not debit_with_fee.empty:
             pass2 = match(
                 debit_with_fee, journal_only_remaining,
@@ -154,15 +152,9 @@ def reconcile_card(
                 date_tolerance_days=profile.date_tolerance_days,
             )
             # パス2でマッチした行は元の金額列に戻してから出力する
-            pass2_matched = _restore_original_amount(
-                pass2.matched, profile.amount_col, original_amount_col_backup,
-            )
-            pass2_duplicates = _restore_original_amount(
-                pass2.duplicates, profile.amount_col, original_amount_col_backup,
-            )
-            pass2_debit_only = _restore_original_amount(
-                pass2.debit_only, profile.amount_col, original_amount_col_backup,
-            )
+            pass2_matched     = _restore_original_amount(pass2.matched,     profile.amount_col)
+            pass2_duplicates  = _restore_original_amount(pass2.duplicates,  profile.amount_col)
+            pass2_debit_only  = _restore_original_amount(pass2.debit_only,  profile.amount_col)
             matched_chunks.append(_tag_amount_kind(pass2_matched, "本体+手数料"))
             duplicates_chunks.append(_tag_amount_kind(pass2_duplicates, "本体+手数料"))
             # パス2対象外（手数料0の行）と パス2でも未消化の行を再合流
@@ -203,34 +195,32 @@ _AMOUNT_BACKUP_COL = "_original_amount"
 
 def _build_fee_inclusive_debit(
     debit_only: pd.DataFrame, profile: CardProfile,
-) -> tuple[pd.DataFrame, str]:
+) -> pd.DataFrame:
     """パス2用に「本体+手数料」金額列を上書きした DataFrame を返す。
 
-    対象は fee_cols のいずれかが0より大きい行のみ。元の金額は _original_amount に退避。
+    対象は fee_cols のいずれかが0より大きい行のみ。元の金額は _AMOUNT_BACKUP_COL に退避。
     """
     df = debit_only.copy()
     fees_total = sum(df[c].astype(float) for c in profile.fee_cols)
     has_fee = fees_total > 0
     df = df[has_fee].copy()
     if df.empty:
-        return df, _AMOUNT_BACKUP_COL
+        return df
 
     df[_AMOUNT_BACKUP_COL] = df[profile.amount_col]
     df[profile.amount_col] = (
         df[profile.amount_col].astype(float) + fees_total[has_fee]
     ).astype(str)
-    return df, _AMOUNT_BACKUP_COL
+    return df
 
 
-def _restore_original_amount(
-    df: pd.DataFrame, amount_col: str, backup_col: str,
-) -> pd.DataFrame:
+def _restore_original_amount(df: pd.DataFrame, amount_col: str) -> pd.DataFrame:
     """パス2用に上書きした金額列を元の値に戻す。"""
-    if df.empty or backup_col not in df.columns:
+    if df.empty or _AMOUNT_BACKUP_COL not in df.columns:
         return df
     df = df.copy()
-    df[amount_col] = df[backup_col]
-    df = df.drop(columns=[backup_col], errors="ignore")
+    df[amount_col] = df[_AMOUNT_BACKUP_COL]
+    df = df.drop(columns=[_AMOUNT_BACKUP_COL], errors="ignore")
     return df
 
 
