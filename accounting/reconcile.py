@@ -22,14 +22,16 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from .auto_clear import auto_clear
 from .card_profiles import PROFILES, CardProfile
 from .classifier import classify
 from .matcher import MatchResult, match
 from .receivable_reconcile import reconcile_receivables
 
-DEFAULT_JOURNAL = Path("data/accounting/仕訳帳.csv")
-DEFAULT_RULES   = Path("accounting/rules/merchant_rules.yml")
-DEFAULT_OUTPUT  = Path("data/accounting/output")
+DEFAULT_JOURNAL          = Path("data/accounting/仕訳帳.csv")
+DEFAULT_RULES            = Path("accounting/rules/merchant_rules.yml")
+DEFAULT_AUTO_CLEAR_RULES = Path("accounting/rules/auto_clear_rules.yml")
+DEFAULT_OUTPUT           = Path("data/accounting/output")
 
 # 仕訳帳のカード照合スコープから除外する反対側勘定科目
 NON_VISA_OPPOSITE = {"普通預金", "現金"}
@@ -282,6 +284,7 @@ def _print_summary(
     reports: list[CardReport],
     journal_only_count: int,
     receivable_matched_count: int = 0,
+    auto_clear_count: int = 0,
 ) -> None:
     print()
     for report in reports:
@@ -318,6 +321,8 @@ def _print_summary(
                 print(f"  {key}: {value}件")
 
     print(f"売掛金照合: {receivable_matched_count}件 ペア消化")
+    if auto_clear_count > 0:
+        print(f"自動消し込み: {auto_clear_count}件")
     print(f"仕訳帳のみ: {journal_only_count}件（他ツールでの照合待ち）")
 
 
@@ -327,6 +332,7 @@ def run(
     journal: Path,
     rules: Path,
     output: Path,
+    auto_clear_rules: Path | None = None,
 ) -> list[CardReport]:
     """全カードを順に照合し、結果CSVを output 配下に書き出す"""
     journal_df = pd.read_csv(journal, encoding="cp932", dtype=str).fillna("")
@@ -347,6 +353,19 @@ def run(
     _write_receivable_outputs(receivable_result.matched, output)
     consumed_nos |= receivable_result.consumed_journal_nos
 
+    # F-06 自動消し込みフィルタ：YAMLルールにマッチする「明らかに正しい」行を消化
+    auto_clear_count = 0
+    if auto_clear_rules is not None and auto_clear_rules.exists():
+        ac_rules = yaml.safe_load(auto_clear_rules.read_text(encoding="utf-8"))["rules"]
+        # 既に消化済みの行は対象外にする
+        unconsumed = journal_df[
+            ~journal_df["取引No"].astype(str).isin(consumed_nos)
+        ]
+        ac_result = auto_clear(unconsumed, ac_rules)
+        _write_auto_clear_outputs(ac_result.cleared, output)
+        consumed_nos |= ac_result.consumed_journal_nos
+        auto_clear_count = len(ac_result.cleared)
+
     journal_remaining = journal_df[
         ~journal_df["取引No"].astype(str).isin(consumed_nos)
     ].reset_index(drop=True)
@@ -354,7 +373,10 @@ def run(
     journal_remaining.to_csv(journal_only_path, index=False, encoding="utf-8-sig")
     print(f"仕訳帳のみ.csv: {len(journal_remaining)} 件 → {journal_only_path}")
 
-    _print_summary(reports, len(journal_remaining), len(receivable_result.matched))
+    _print_summary(
+        reports, len(journal_remaining),
+        len(receivable_result.matched), auto_clear_count,
+    )
     return reports
 
 
@@ -365,6 +387,15 @@ def _write_receivable_outputs(matched: pd.DataFrame, output_dir: Path) -> None:
     path = receivable_dir / "売掛金_照合済み.csv"
     matched.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"[receivable] 売掛金_照合済み.csv: {len(matched)} 件 → {path}")
+
+
+def _write_auto_clear_outputs(cleared: pd.DataFrame, output_dir: Path) -> None:
+    """自動消し込み結果を output_dir/auto_cleared/ 配下に書き出す"""
+    ac_dir = output_dir / "auto_cleared"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    path = ac_dir / "auto_cleared.csv"
+    cleared.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[auto_cleared] auto_cleared.csv: {len(cleared)} 件 → {path}")
 
 
 def main() -> None:
@@ -380,6 +411,9 @@ def main() -> None:
                         help=f"freee仕訳帳CSV (default: {DEFAULT_JOURNAL})")
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES,
                         help=f"勘定科目ルールYAML (default: {DEFAULT_RULES})")
+    parser.add_argument("--auto-clear-rules", type=Path, default=DEFAULT_AUTO_CLEAR_RULES,
+                        dest="auto_clear_rules",
+                        help=f"自動消し込みルールYAML (default: {DEFAULT_AUTO_CLEAR_RULES})")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
                         help=f"出力ディレクトリ (default: {DEFAULT_OUTPUT})")
     args = parser.parse_args()
@@ -388,6 +422,7 @@ def main() -> None:
         profiles=list(PROFILES.values()),
         journal=args.journal,
         rules=args.rules,
+        auto_clear_rules=args.auto_clear_rules,
         output=args.output,
     )
 

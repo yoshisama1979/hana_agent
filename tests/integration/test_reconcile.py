@@ -323,6 +323,56 @@ def test_receivable_consumed_rows_excluded_from_journal_only(setup_env):
 
 
 # ---------------------------------------------------------------------------
+# F-06: 自動消し込みフィルタの実行と仕訳帳のみからの除外
+# ---------------------------------------------------------------------------
+def test_auto_clear_writes_csv_and_excludes_from_journal_only(setup_env, tmp_path):
+    # 振込手数料の仕訳を1件追加
+    journal_path = setup_env["journal"]
+    df = pd.read_csv(journal_path, encoding="cp932", dtype=str).fillna("")
+    fee_row = pd.DataFrame([{
+        "取引No": "99", "取引日": "2025/04/30",
+        "借方勘定科目": "支払手数料", "借方金額(円)": "140",
+        "貸方勘定科目": "普通預金", "貸方補助科目": SBI_ACCOUNT, "貸方金額(円)": "140",
+        "摘要": "振込手数料",
+    }])
+    for col in df.columns:
+        if col not in fee_row.columns:
+            fee_row[col] = ""
+    fee_row = fee_row[df.columns]
+    pd.concat([df, fee_row], ignore_index=True).to_csv(
+        journal_path, index=False, encoding="cp932",
+    )
+
+    # 自動消し込みルール
+    auto_clear_rules = tmp_path / "auto_clear_rules.yml"
+    auto_clear_rules.write_text(
+        "rules:\n"
+        "  - name: 振込手数料\n"
+        "    借方勘定科目: 支払手数料\n"
+        "    貸方勘定科目: 普通預金\n"
+        "    摘要正規表現: 振込手数料\n",
+        encoding="utf-8",
+    )
+
+    run(**setup_env, auto_clear_rules=auto_clear_rules)
+
+    # 出力CSV確認
+    cleared_csv = setup_env["output"] / "auto_cleared" / "auto_cleared.csv"
+    assert cleared_csv.exists()
+    cleared = pd.read_csv(cleared_csv, encoding="utf-8-sig", dtype=str)
+    assert len(cleared) == 1
+    assert cleared.iloc[0]["取引No"] == "99"
+    assert cleared.iloc[0]["適用ルール"] == "振込手数料"
+
+    # 仕訳帳のみから除外
+    journal_only = pd.read_csv(
+        setup_env["output"] / "仕訳帳のみ.csv",
+        encoding="utf-8-sig", dtype=str,
+    )
+    assert "99" not in set(journal_only["取引No"].astype(str))
+
+
+# ---------------------------------------------------------------------------
 # S-1（リグレッション）：日付近さ優先で、本体+手数料が大ズレ本体マッチに勝つ
 #
 # 想定シナリオ：
