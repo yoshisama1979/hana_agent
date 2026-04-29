@@ -48,7 +48,7 @@ COMPACT_COLS = [
     "利用内容（入力）",
     "借方勘定科目", "借方勘定科目（入力）", "補助科目（入力）", "借方金額(円)",
     "貸方勘定科目", "貸方補助科目", "貸方金額(円)", "摘要",
-    "要目視確認",
+    "要目視確認", "照合方法", "日付ズレ日数",
 ]
 
 
@@ -129,6 +129,7 @@ def reconcile_card(
         debit_target, journal_scope,
         debit_date_col=profile.date_col,
         debit_amount_col=profile.amount_col,
+        date_tolerance_days=profile.date_tolerance_days,
     )
 
     matched_df    = _add_account(result.matched,    profile.merchant_col, rules)
@@ -187,10 +188,21 @@ def _print_summary(reports: list[CardReport], journal_only_count: int) -> None:
         if total == 0:
             print(f"カード照合({report.profile.card_id}): 〇 すべて照合済み")
         else:
-            breakdown = ", ".join(f"{k} {v}件" for k, v in issues.items() if v > 0)
-            print(
-                f"カード照合({report.profile.card_id}): × 未解決 {total}件（{breakdown}）"
+            print(f"カード照合({report.profile.card_id}): × 未解決 {total}件")
+
+        # 段階別の消化件数を表示（date_tolerance_days > 0 のカードのみ意味あり）
+        if not report.matched.empty and "日付ズレ日数" in report.matched.columns:
+            offset_counts = (
+                report.matched["日付ズレ日数"].astype(int).value_counts().sort_index()
             )
+            for offset, count in offset_counts.items():
+                label = "完全一致" if offset == 0 else f"日付ズレ ±{offset}日"
+                print(f"  {label}: {count}件")
+
+        for key, value in issues.items():
+            if value > 0:
+                print(f"  {key}: {value}件")
+
     print(f"仕訳帳のみ: {journal_only_count}件（カード照合外・他ツールでの照合待ち）")
 
 

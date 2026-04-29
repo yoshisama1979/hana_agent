@@ -194,3 +194,172 @@ def test_match_handles_negative_decimal_amount():
     )
 
     assert len(result.matched) == 1
+
+
+# ---------------------------------------------------------------------------
+# M1: date_tolerance_days のデフォルトは0で、後方互換（既存挙動と一致）
+# 厳格一致のみで段階拡張は行われない。
+# ---------------------------------------------------------------------------
+def test_match_default_tolerance_zero_keeps_strict_behavior():
+    debit = _risona([
+        {"利用日": "2025年04月07日", "利用内容": "ZOOM", "金額": "4968"},
+        {"利用日": "2025年04月15日", "利用内容": "APPLE", "金額": "1680"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/07", "借方金額(円)": "4968", "摘要": "ZOOM"},
+        {"取引日": "2025/04/16", "借方金額(円)": "1680", "摘要": "APPLE"},  # 1日ズレ
+    ])
+
+    result = match(debit, journal)
+
+    # 厳格一致（4/7 ZOOM のみ）。APPLEは未マッチ。
+    assert len(result.matched) == 1
+    assert len(result.debit_only) == 1
+    assert len(result.journal_only) == 1
+
+
+# ---------------------------------------------------------------------------
+# M2: date_tolerance_days=1 で日付ズレ1日の同金額がマッチする
+# ---------------------------------------------------------------------------
+def test_match_with_tolerance_one_pairs_one_day_off():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "APPLE", "お取引金額": "1680"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/16", "借方金額(円)": "1680", "摘要": "APPLE"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=1,
+    )
+
+    assert len(result.matched) == 1
+    assert result.matched.iloc[0]["照合方法"] == "日付ズレ"
+    assert int(result.matched.iloc[0]["日付ズレ日数"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# M3: 厳格一致で消化された行は段階1以降の対象外
+# 同金額に厳格一致候補とズレ候補が両方ある場合、厳格一致が優先消化される
+# ---------------------------------------------------------------------------
+def test_match_prefers_exact_match_over_date_offset():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "APPLE A", "お取引金額": "1680"},
+        {"お取引日": "2025/04/20", "お取引内容": "APPLE B", "お取引金額": "1680"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/15", "借方金額(円)": "1680", "摘要": "厳格一致"},
+        {"取引日": "2025/04/21", "借方金額(円)": "1680", "摘要": "1日ズレ"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=1,
+    )
+
+    # 4/15 同士は厳格一致。4/20 と 4/21 は1日ズレでマッチ。
+    assert len(result.matched) == 2
+    # 厳格一致行を取り出す
+    exact = result.matched[result.matched["照合方法"] == "完全一致"]
+    fuzzy = result.matched[result.matched["照合方法"] == "日付ズレ"]
+    assert len(exact) == 1
+    assert len(fuzzy) == 1
+    # 厳格一致は 4/15 同士
+    assert exact.iloc[0]["お取引日"] == "2025/04/15"
+    assert exact.iloc[0]["取引日"] == "2025/04/15"
+
+
+# ---------------------------------------------------------------------------
+# M4: 完全一致行に「照合方法=完全一致」「日付ズレ日数=0」が付く
+# ---------------------------------------------------------------------------
+def test_match_tags_exact_pairs_with_zero_offset():
+    debit = _risona([{"利用日": "2025年04月07日", "利用内容": "ZOOM", "金額": "4968"}])
+    journal = _journal([
+        {"取引日": "2025/04/07", "借方金額(円)": "4968", "摘要": "VISAデビ"}
+    ])
+
+    result = match(debit, journal, date_tolerance_days=7)
+
+    assert len(result.matched) == 1
+    assert result.matched.iloc[0]["照合方法"] == "完全一致"
+    assert int(result.matched.iloc[0]["日付ズレ日数"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# M5: 段階N=2 で +2日, -2日 双方向のズレが拾える
+# ---------------------------------------------------------------------------
+def test_match_with_tolerance_pairs_both_directions():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/10", "お取引内容": "FORWARD", "お取引金額": "1000"},
+        {"お取引日": "2025/04/20", "お取引内容": "BACKWARD", "お取引金額": "2000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/12", "借方金額(円)": "1000", "摘要": "+2日"},
+        {"取引日": "2025/04/18", "借方金額(円)": "2000", "摘要": "-2日"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=2,
+    )
+
+    assert len(result.matched) == 2
+    assert (result.matched["照合方法"] == "日付ズレ").all()
+    assert set(result.matched["日付ズレ日数"].astype(int)) == {2}
+
+
+# ---------------------------------------------------------------------------
+# M6: 段階1 内で複数候補がある場合 greedy に1:1で消化
+# ---------------------------------------------------------------------------
+def test_match_greedy_pairing_within_stage():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/15", "お取引内容": "A", "お取引金額": "1000"},
+        {"お取引日": "2025/04/15", "お取引内容": "B", "お取引金額": "1000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/16", "借方金額(円)": "1000", "摘要": "X"},
+        {"取引日": "2025/04/16", "借方金額(円)": "1000", "摘要": "Y"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=1,
+    )
+
+    # 2件 × 2件 → 2ペア成立
+    assert len(result.matched) == 2
+    assert len(result.debit_only) == 0
+    assert len(result.journal_only) == 0
+    assert (result.matched["日付ズレ日数"].astype(int) == 1).all()
+
+
+# ---------------------------------------------------------------------------
+# M7: 許容範囲を超えるズレは未マッチのまま残る
+# ---------------------------------------------------------------------------
+def test_match_keeps_unmatched_beyond_tolerance():
+    debit = pd.DataFrame([
+        {"お取引日": "2025/04/01", "お取引内容": "FAR", "お取引金額": "5000"},
+    ])
+    journal = _journal([
+        {"取引日": "2025/04/15", "借方金額(円)": "5000", "摘要": "14日離れ"},
+    ])
+
+    result = match(
+        debit, journal,
+        debit_date_col="お取引日",
+        debit_amount_col="お取引金額",
+        date_tolerance_days=7,
+    )
+
+    assert len(result.matched) == 0
+    assert len(result.debit_only) == 1
+    assert len(result.journal_only) == 1

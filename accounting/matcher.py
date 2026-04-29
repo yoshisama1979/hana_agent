@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 import pandas as pd
 
@@ -49,79 +50,166 @@ def _normalize_amount(series: pd.Series) -> pd.Series:
     )
 
 
+def _to_date(iso: str) -> date:
+    """YYYY-MM-DD 形式の文字列を date オブジェクトに変換する。"""
+    y, m, d = iso.split("-")
+    return date(int(y), int(m), int(d))
+
+
 def match(
     debit: pd.DataFrame,
     journal: pd.DataFrame,
     *,
     debit_date_col: str = "利用日",
     debit_amount_col: str = "金額",
+    date_tolerance_days: int = 0,
 ) -> MatchResult:
     """カード明細と仕訳帳を金額＋日付で照合し、MatchResult を返す。
 
     debit_date_col / debit_amount_col でカード固有のカラム名を指定できる。
-    デフォルトはりそなの "利用日" / "金額"。
+    date_tolerance_days > 0 を指定すると、日付ズレ0日 → 1日 → ... → N日 と
+    段階的にマッチングを行い、ズレの少ないペアから順に消化する。
     """
-    r = debit.copy()
-    j = journal.copy()
+    r = debit.copy().reset_index(drop=True)
+    j = journal.copy().reset_index(drop=True)
 
     r["_date"] = _normalize_date(r[debit_date_col])
     r["_amount"] = _normalize_amount(r[debit_amount_col])
-
     j["_date"] = _normalize_date(j["取引日"])
     j["_amount"] = _normalize_amount(j["借方金額(円)"])
+    r["_dt"] = r["_date"].apply(_to_date)
+    j["_dt"] = j["_date"].apply(_to_date)
 
-    r["_key"] = r["_date"] + "_" + r["_amount"]
-    j["_key"] = j["_date"] + "_" + j["_amount"]
+    drop_cols = ["_date", "_amount", "_key", "_dt"]
 
-    all_keys = set(r["_key"]) | set(j["_key"])
-    matched_rows: list[pd.DataFrame] = []
-    dup_rows: list[pd.DataFrame] = []
-    debit_only_rows: list[pd.DataFrame] = []
-    journal_only_rows: list[pd.DataFrame] = []
+    matched_chunks: list[pd.DataFrame] = []
+    dup_chunks: list[pd.DataFrame] = []
+    used_r: set = set()
+    used_j: set = set()
 
-    drop_cols = ["_date", "_amount", "_key"]
+    for offset in range(date_tolerance_days + 1):
+        r_remaining = r[~r.index.isin(used_r)]
+        j_remaining = j[~j.index.isin(used_j)]
+        if r_remaining.empty or j_remaining.empty:
+            continue
 
-    for key in all_keys:
-        r_rows = r[r["_key"] == key].drop(columns=drop_cols).reset_index(drop=True)
-        j_rows = j[j["_key"] == key].drop(columns=drop_cols).reset_index(drop=True)
-        rc = len(r_rows)
-        jc = len(j_rows)
-
-        if rc == 0:
-            journal_only_rows.append(j_rows)
-        elif jc == 0:
-            debit_only_rows.append(r_rows)
-        elif rc == jc:
-            # 件数一致（1:1 または N:N）→ matched（N:N は要目視フラグ付き）
-            needs_review = rc > 1
-            for i in range(rc):
-                pair = (
-                    r_rows.iloc[[i]]
-                    .reset_index(drop=True)
-                    .join(j_rows.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
-                )
-                pair["要目視確認"] = "要確認" if needs_review else ""
-                matched_rows.append(pair)
+        if offset == 0:
+            stage_matched, stage_dup, paired_r, paired_j = _match_exact(
+                r_remaining, j_remaining, drop_cols,
+            )
         else:
-            # 件数不一致 → duplicates＋余剰は未照合へ
-            for i in range(min(rc, jc)):
-                pair = (
-                    r_rows.iloc[[i]]
-                    .reset_index(drop=True)
-                    .join(j_rows.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
-                )
-                dup_rows.append(pair)
-            if rc > jc:
-                debit_only_rows.append(r_rows.iloc[jc:].reset_index(drop=True))
-            elif jc > rc:
-                journal_only_rows.append(j_rows.iloc[rc:].reset_index(drop=True))
+            stage_matched, stage_dup, paired_r, paired_j = _match_with_offset(
+                r_remaining, j_remaining, offset, drop_cols,
+            )
+
+        for df in (stage_matched, stage_dup):
+            if not df.empty:
+                df["照合方法"] = "完全一致" if offset == 0 else "日付ズレ"
+                df["日付ズレ日数"] = offset
+
+        if not stage_matched.empty:
+            matched_chunks.append(stage_matched)
+        if not stage_dup.empty:
+            dup_chunks.append(stage_dup)
+        used_r.update(paired_r)
+        used_j.update(paired_j)
+
+    debit_only = r[~r.index.isin(used_r)].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+    journal_only = j[~j.index.isin(used_j)].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
 
     def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     return MatchResult(
-        matched=_concat(matched_rows),
-        duplicates=_concat(dup_rows),
-        debit_only=_concat(debit_only_rows),
-        journal_only=_concat(journal_only_rows),
+        matched=_concat(matched_chunks),
+        duplicates=_concat(dup_chunks),
+        debit_only=debit_only,
+        journal_only=journal_only,
     )
+
+
+def _match_exact(
+    r: pd.DataFrame, j: pd.DataFrame, drop_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, list, list]:
+    """段階0：同日・同金額でグループ化し、件数一致なら 1:1 / N:N、不一致は重複要確認。"""
+    r = r.copy()
+    j = j.copy()
+    r["_key"] = r["_date"] + "_" + r["_amount"]
+    j["_key"] = j["_date"] + "_" + j["_amount"]
+
+    matched_rows: list[pd.DataFrame] = []
+    dup_rows: list[pd.DataFrame] = []
+    paired_r: list = []
+    paired_j: list = []
+
+    for key in set(r["_key"]) & set(j["_key"]):
+        r_rows = r[r["_key"] == key]
+        j_rows = j[j["_key"] == key]
+        rc, jc = len(r_rows), len(j_rows)
+
+        r_clean = r_rows.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+        j_clean = j_rows.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+
+        if rc == jc:
+            needs_review = rc > 1
+            for i in range(rc):
+                pair = (
+                    r_clean.iloc[[i]].reset_index(drop=True)
+                    .join(j_clean.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
+                )
+                pair["要目視確認"] = "要確認" if needs_review else ""
+                matched_rows.append(pair)
+            paired_r.extend(r_rows.index.tolist())
+            paired_j.extend(j_rows.index.tolist())
+        else:
+            n = min(rc, jc)
+            for i in range(n):
+                pair = (
+                    r_clean.iloc[[i]].reset_index(drop=True)
+                    .join(j_clean.iloc[[i]].reset_index(drop=True), rsuffix="_journal")
+                )
+                pair["要目視確認"] = ""
+                dup_rows.append(pair)
+            # 件数不一致時は少ない方の件数だけ paired として消費する
+            if rc <= jc:
+                paired_r.extend(r_rows.index.tolist())
+                paired_j.extend(j_rows.index.tolist()[:n])
+            else:
+                paired_r.extend(r_rows.index.tolist()[:n])
+                paired_j.extend(j_rows.index.tolist())
+
+    def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    return _concat(matched_rows), _concat(dup_rows), paired_r, paired_j
+
+
+def _match_with_offset(
+    r: pd.DataFrame, j: pd.DataFrame, offset: int, drop_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, list, list]:
+    """段階1以上：金額一致＆|日付差|==offset の行同士を greedy に1:1ペアリング。"""
+    matched_rows: list[pd.DataFrame] = []
+    paired_r: list = []
+    paired_j: list = []
+    used_j_idx: set = set()
+
+    for r_idx, r_row in r.iterrows():
+        for j_idx, j_row in j.iterrows():
+            if j_idx in used_j_idx:
+                continue
+            if r_row["_amount"] != j_row["_amount"]:
+                continue
+            if abs((r_row["_dt"] - j_row["_dt"]).days) != offset:
+                continue
+            r_clean = r.loc[[r_idx]].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+            j_clean = j.loc[[j_idx]].drop(columns=drop_cols, errors="ignore").reset_index(drop=True)
+            pair = r_clean.join(j_clean, rsuffix="_journal")
+            pair["要目視確認"] = ""
+            matched_rows.append(pair)
+            paired_r.append(r_idx)
+            paired_j.append(j_idx)
+            used_j_idx.add(j_idx)
+            break
+
+    matched = pd.concat(matched_rows, ignore_index=True) if matched_rows else pd.DataFrame()
+    return matched, pd.DataFrame(), paired_r, paired_j

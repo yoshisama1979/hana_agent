@@ -26,6 +26,8 @@ class CardProfile:
     has_status: bool      # ステータス列を持つか（持たないカードは全行確定扱い）
     debit_pattern: str    # 明細CSVのパス（単一ファイル or glob パターン）
     debit_encoding: str = "cp932"
+    # 日付許容ズレ。0 なら厳格一致のみ、>0 なら段階マッチで ±N日まで吸収する。
+    date_tolerance_days: int = 0
 
     def load_debit(self) -> pd.DataFrame:
         """明細CSVを読み込んで返す。
@@ -72,5 +74,7 @@ PROFILES: dict[str, CardProfile] = {
         merchant_col="お取引内容",
         has_status=False,
         debit_pattern=str(Path("data/accounting/meisai_*.csv")),
+        # SBIは「カード利用日」と「口座引落日」が最大数日ズレるため段階マッチで吸収する
+        date_tolerance_days=7,
     ),
 }

@@ -22,6 +22,8 @@ def test_sbi_profile_is_defined():
     assert sbi.amount_col == "お取引金額"
     assert sbi.merchant_col == "お取引内容"
     assert sbi.has_status is False
+    # 利用日と引落日のズレを吸収するため、SBIは±7日まで段階的に許容する
+    assert sbi.date_tolerance_days == 7
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,24 @@ def test_risona_profile_is_defined():
     assert risona.amount_col == "金額"
     assert risona.merchant_col == "利用内容"
     assert risona.has_status is True
+    # りそなは現状ズレ吸収不要なので 0（厳格一致のみ）
+    assert risona.date_tolerance_days == 0
+
+
+# ---------------------------------------------------------------------------
+# A-3: date_tolerance_days のデフォルト値は 0（後方互換）
+# ---------------------------------------------------------------------------
+def test_card_profile_date_tolerance_default_is_zero():
+    profile = CardProfile(
+        card_id="dummy",
+        account_name="dummy",
+        date_col="利用日",
+        amount_col="金額",
+        merchant_col="利用内容",
+        has_status=False,
+        debit_pattern="dummy",
+    )
+    assert profile.date_tolerance_days == 0
 
 
 # ---------------------------------------------------------------------------
